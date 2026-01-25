@@ -44,7 +44,7 @@ class PreferenceTrainingExample:
     negative_policies: List[RoutePolicy]
 
 
-def _load_label_mapping(path: Path) -> Dict[str, str]:
+def _load_label_mapping(path: Path) -> Dict[str, Tuple[RoutePolicy, List[RoutePolicy]]]:
     if not path.exists():
         raise FileNotFoundError(f"Label mapping file not found: {path}")
 
@@ -70,8 +70,10 @@ def _load_label_mapping(path: Path) -> Dict[str, str]:
                 continue
             item = json.loads(line)
             sample_id = str(item.get("sample_id", "").strip())
-            truth_policy = item.get("truth_policy")
-            negative_policies = item.get("negative_policies", [])
+            truth_policy = RoutePolicy.from_dict(item.get("truth_policy", {}))
+            negative_policies = [
+                RoutePolicy.from_dict(p) for p in item.get("negative_policies", [])
+            ]
             if sample_id and truth_policy:
                 mapping[sample_id] = (truth_policy, negative_policies)
     if not mapping:
@@ -121,10 +123,12 @@ def build_training_examples(
     for idx, conversation in enumerate(iter_sharegpt_conversations(dataset_path)):
         if idx < start_index:
             continue
-        truth_policy, negative_policies = label_mapping.get(conversation.sample_id)
+        policy_pairs = label_mapping.get(conversation.sample_id)
 
-        if not truth_policy:
+        if not policy_pairs:
             continue
+
+        truth_policy, negative_policies = policy_pairs
         examples.append(
             PreferenceTrainingExample(
                 conversation=conversation,
@@ -222,11 +226,10 @@ def build_prompt(
 
 def get_random_label_space(
     available_labels: List[RoutePolicy],
-    target_label: RoutePolicy,
     max_labels_in_prompt: int,
     min_labels_in_prompt: int,
     rng: np.random.Generator,
-) -> List[str]:
+) -> List[RoutePolicy]:
     max_candidates = len(available_labels)
     upper_bound = (
         max_candidates
@@ -234,28 +237,13 @@ def get_random_label_space(
         else min(max_labels_in_prompt, max_candidates)
     )
     lower_bound = min(min_labels_in_prompt, upper_bound)
-
-    base_labels = {target_label, CATCH_ALL_LABEL}
-    lower_bound = max(lower_bound, len(base_labels))
-    upper_bound = max(upper_bound, len(base_labels))
-
     sample_size = (
         upper_bound
         if lower_bound == upper_bound
         else int(rng.integers(lower_bound, upper_bound + 1))
     )
-
-    chosen_labels = set(base_labels)
-    remaining_needed = sample_size - len(chosen_labels)
-    if remaining_needed > 0:
-        negative_pool = [
-            label for label in available_labels if label not in chosen_labels
-        ]
-        if negative_pool:
-            sampled = rng.choice(negative_pool, size=remaining_needed, replace=False)
-            chosen_labels.update(sampled.tolist())
-
-    randomized_label_space = rng.permutation(list(chosen_labels)).tolist()
+    sampled = rng.choice(available_labels, size=sample_size, replace=False)
+    randomized_label_space = rng.permutation(list(sampled)).tolist()
     return randomized_label_space
 
 
@@ -310,7 +298,6 @@ class ChatAlignedDataset(TorchDataset):
         )
         random_label_space = get_random_label_space(
             available_labels=label_space,
-            target_label=example.truth_policy,
             max_labels_in_prompt=self.max_labels_in_prompt,
             min_labels_in_prompt=self.min_labels_in_prompt,
             rng=rng,
@@ -464,7 +451,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--label-map-path",
         type=Path,
-        default=Path("verified_sharegpt_policy_labels_2.jsonl"),
+        default=Path("sharegpt_preference_labeled_with_negative.jsonl"),
         help="Path to sample_id -> label mapping (JSON or JSONL).",
     )
     parser.add_argument(
@@ -511,7 +498,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=4,
+        default=24,
         help="Per-device train batch size.",
     )
     parser.add_argument(

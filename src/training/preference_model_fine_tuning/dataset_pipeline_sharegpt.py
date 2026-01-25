@@ -60,11 +60,27 @@ class RoutePolicySampleWithLabelSpace:
     truth_policy: RoutePolicy
     negative_policies: List[RoutePolicy]
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, any]) -> RoutePolicySampleWithLabelSpace:
+        truth_policy_data = data.get("truth_policy", {})
+        negative_policies_data = data.get("negative_policies", [])
+        return cls(
+            sample_id=data.get("sample_id", ""),
+            truth_policy=RoutePolicy.from_dict(truth_policy_data),
+            negative_policies=[
+                RoutePolicy.from_dict(p) for p in negative_policies_data
+            ],
+        )
+
 
 @dataclass
 class RoutePolicy:
     label: str
     description: str
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, str]) -> RoutePolicy:
+        return cls(label=data.get("label", ""), description=data.get("description", ""))
 
 
 @dataclass
