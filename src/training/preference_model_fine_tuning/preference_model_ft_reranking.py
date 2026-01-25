@@ -16,19 +16,20 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from datasets import Dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     PreTrainedTokenizerBase,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
 )
+from torch.utils.data import Dataset as TorchDataset
 
-from dataset_pipeline_sharegpt import ShareGPTConversation, Turn
+from dataset_pipeline_sharegpt import ShareGPTConversation, Turn, RoutePolicy
 
 
-CATCH_ALL_LABEL = "general_inquiry"
+CATCH_ALL_LABEL = "none_of_the_above"
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a routing controller that reads a conversation and outputs "
@@ -39,7 +40,8 @@ DEFAULT_SYSTEM_PROMPT = (
 @dataclass
 class PreferenceTrainingExample:
     conversation: ShareGPTConversation
-    label: str
+    truth_policy: RoutePolicy
+    negative_policies: List[RoutePolicy]
 
 
 def _load_label_mapping(path: Path) -> Dict[str, str]:
@@ -68,9 +70,10 @@ def _load_label_mapping(path: Path) -> Dict[str, str]:
                 continue
             item = json.loads(line)
             sample_id = str(item.get("sample_id", "").strip())
-            label = str(item.get("label", "").strip())
-            if sample_id and label:
-                mapping[sample_id] = label
+            truth_policy = item.get("truth_policy")
+            negative_policies = item.get("negative_policies", [])
+            if sample_id and truth_policy:
+                mapping[sample_id] = (truth_policy, negative_policies)
     if not mapping:
         raise ValueError(f"No label mappings found in {path}")
     return mapping
@@ -118,11 +121,16 @@ def build_training_examples(
     for idx, conversation in enumerate(iter_sharegpt_conversations(dataset_path)):
         if idx < start_index:
             continue
-        label = label_mapping.get(conversation.sample_id)
-        if not label:
+        truth_policy, negative_policies = label_mapping.get(conversation.sample_id)
+
+        if not truth_policy:
             continue
         examples.append(
-            PreferenceTrainingExample(conversation=conversation, label=label)
+            PreferenceTrainingExample(
+                conversation=conversation,
+                truth_policy=truth_policy,
+                negative_policies=negative_policies,
+            )
         )
         if max_samples and len(examples) >= max_samples:
             break
@@ -144,12 +152,16 @@ def conversation_to_text(conversation: ShareGPTConversation) -> str:
 
 def build_prompt(
     conversation: ShareGPTConversation,
-    label_space: Sequence[str],
+    label_space: Sequence[RoutePolicy],
     tokenizer: PreTrainedTokenizerBase,
     max_length: int,
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
 ) -> List[int]:
-    label_clause = ", ".join(sorted(set(label_space)))
+    label_clauses = []
+    for policy in label_space:
+        label_clauses.append(f"- {policy.label}: {policy.description}")
+    label_clause = "\n".join(label_clauses)
+
     convo_text = conversation_to_text(conversation)
 
     system_ids = tokenizer(
@@ -158,13 +170,13 @@ def build_prompt(
         truncation=False,
     )["input_ids"]
 
-    instruction_content = "\nAnswer with the single label that best matches the conversation. Do not include thinking process.\n"
+    instruction_content = "\nAnswer with the single routing policy that best matches the conversation. Do not include thinking process.\n"
     instruction_ids = tokenizer(
         instruction_content,
         add_special_tokens=False,
         truncation=False,
     )["input_ids"]
-    label_content = f"Valid labels: {label_clause}"
+    label_content = f"Each policy is represented by a label, followed by a short description. Valid policies:\n{label_clause}"
     label_ids = tokenizer(
         label_content,
         add_special_tokens=False,
@@ -209,8 +221,8 @@ def build_prompt(
 
 
 def get_random_label_space(
-    available_labels: List[str],
-    target_label: str,
+    available_labels: List[RoutePolicy],
+    target_label: RoutePolicy,
     max_labels_in_prompt: int,
     min_labels_in_prompt: int,
     rng: np.random.Generator,
@@ -247,67 +259,117 @@ def get_random_label_space(
     return randomized_label_space
 
 
-def build_chat_aligned_dataset(
-    examples: Sequence[PreferenceTrainingExample],
-    tokenizer: PreTrainedTokenizerBase,
-    max_length: int,
-    rng: np.random.Generator,
-    max_labels_in_prompt: int,
-    min_labels_in_prompt: int,
-    pad_to_max_length: bool = False,
-) -> Dataset:
-    input_ids_list: List[List[int]] = []
-    attention_mask_list: List[List[int]] = []
-    labels_list: List[List[int]] = []
+class ChatAlignedDataset(TorchDataset):
+    """Dataset that redraws label spaces per epoch for robustness."""
 
-    label_space = sorted({example.label for example in examples})
-    pad_id = (
-        tokenizer.pad_token_id
-        if tokenizer.pad_token_id is not None
-        else tokenizer.eos_token_id
-    )
+    def __init__(
+        self,
+        examples: Sequence[PreferenceTrainingExample],
+        tokenizer: PreTrainedTokenizerBase,
+        max_length: int,
+        max_labels_in_prompt: int,
+        min_labels_in_prompt: int,
+        seed: int,
+        pad_to_max_length: bool = False,
+    ) -> None:
+        self.examples = list(examples)
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.max_labels_in_prompt = max_labels_in_prompt
+        self.min_labels_in_prompt = min_labels_in_prompt
+        self.pad_to_max_length = pad_to_max_length
+        self.base_seed = seed
+        self.epoch = 0
 
-    for example in examples:
+        self.pad_id = (
+            tokenizer.pad_token_id
+            if tokenizer.pad_token_id is not None
+            else tokenizer.eos_token_id
+        )
+
+    def __len__(self) -> int:
+        return len(self.examples)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def _rng_for_idx(self, idx: int) -> np.random.Generator:
+        # Spread seeds so each epoch reshuffles independently.
+        # 1_000_000 is the max number of samples for each epoch.
+        return np.random.default_rng(self.base_seed + self.epoch * 1_000_000 + idx)
+
+    def __getitem__(self, idx: int) -> Dict[str, List[int]]:
+        example = self.examples[idx]
+        rng = self._rng_for_idx(idx)
+
+        all_negative = rng.random() < 0.1
+        label_space = (
+            [example.truth_policy] + example.negative_policies
+            if not all_negative
+            else example.negative_policies
+        )
         random_label_space = get_random_label_space(
             available_labels=label_space,
-            target_label=example.label,
-            max_labels_in_prompt=max_labels_in_prompt,
-            min_labels_in_prompt=min_labels_in_prompt,
+            target_label=example.truth_policy,
+            max_labels_in_prompt=self.max_labels_in_prompt,
+            min_labels_in_prompt=self.min_labels_in_prompt,
             rng=rng,
         )
+
         prompt_encoding = build_prompt(
             conversation=example.conversation,
             label_space=random_label_space,
-            tokenizer=tokenizer,
-            max_length=max_length,
+            tokenizer=self.tokenizer,
+            max_length=self.max_length,
         )
-        full_encoding: List[int] = (
-            prompt_encoding
-            + tokenizer(
-                f"{example.label}<|im_end|>",
-                add_special_tokens=False,
-                truncation=False,
-            )["input_ids"]
-        )
+
+        label_ids = self.tokenizer(
+            f"{example.truth_policy if not all_negative else CATCH_ALL_LABEL}<|im_end|>",
+            add_special_tokens=False,
+            truncation=False,
+        )["input_ids"]
+
+        full_encoding: List[int] = prompt_encoding + label_ids
+
         labels = full_encoding.copy()
         for i in range(len(prompt_encoding)):
             labels[i] = -100
         for i, token_id in enumerate(full_encoding):
-            if token_id == pad_id:
+            if token_id == self.pad_id:
                 labels[i] = -100
 
-        input_ids_list.append(full_encoding)
-        attention_mask = [1 if token_id != pad_id else 0 for token_id in full_encoding]
-        attention_mask_list.append(attention_mask)
-        labels_list.append(labels)
+        attention_mask = [
+            1 if token_id != self.pad_id else 0 for token_id in full_encoding
+        ]
 
-    return Dataset.from_dict(
-        {
-            "input_ids": input_ids_list,
-            "attention_mask": attention_mask_list,
-            "labels": labels_list,
+        if self.pad_to_max_length:
+            pad_needed = self.max_length - len(full_encoding)
+            if pad_needed > 0:
+                full_encoding = full_encoding + [self.pad_id] * pad_needed
+                attention_mask = attention_mask + [0] * pad_needed
+                labels = labels + [-100] * pad_needed
+            else:
+                full_encoding = full_encoding[: self.max_length]
+                attention_mask = attention_mask[: self.max_length]
+                labels = labels[: self.max_length]
+
+        return {
+            "input_ids": full_encoding,
+            "attention_mask": attention_mask,
+            "labels": labels,
         }
-    )
+
+
+class EpochRandomizationCallback(TrainerCallback):
+    """Reseeds the dataset each epoch to refresh label sampling."""
+
+    def __init__(self, dataset: ChatAlignedDataset) -> None:
+        self.dataset = dataset
+
+    def on_epoch_begin(self, args, state, control, **kwargs):  # type: ignore[override]
+        current_epoch = int(state.epoch or 0)
+        self.dataset.set_epoch(current_epoch)
+        return control
 
 
 class LabelPaddingCollator:
@@ -551,23 +613,40 @@ def train(args: argparse.Namespace) -> None:
     )
     logger.info("Loaded %s labeled examples", len(examples))
     rng = np.random.default_rng(args.seed)
-    hf_dataset = build_chat_aligned_dataset(
-        examples=examples,
+    if args.eval_ratio and args.eval_ratio > 0:
+        eval_size = max(1, int(len(examples) * args.eval_ratio))
+        permutation = rng.permutation(len(examples))
+        eval_indices = permutation[:eval_size]
+        train_indices = permutation[eval_size:]
+        train_examples = [examples[i] for i in train_indices]
+        eval_examples = [examples[i] for i in eval_indices]
+    else:
+        train_examples = examples
+        eval_examples = None
+
+    train_dataset = ChatAlignedDataset(
+        examples=train_examples,
         tokenizer=tokenizer,
         max_length=args.max_length,
         pad_to_max_length=args.pad_to_max_length,
         max_labels_in_prompt=16,
         min_labels_in_prompt=4,
-        rng=rng,
+        seed=args.seed,
     )
 
-    if args.eval_ratio and args.eval_ratio > 0:
-        split = hf_dataset.train_test_split(test_size=args.eval_ratio, seed=args.seed)
-        train_dataset = split["train"]
-        eval_dataset = split["test"]
-    else:
-        train_dataset = hf_dataset
-        eval_dataset = None
+    eval_dataset = (
+        ChatAlignedDataset(
+            examples=eval_examples,
+            tokenizer=tokenizer,
+            max_length=args.max_length,
+            pad_to_max_length=args.pad_to_max_length,
+            max_labels_in_prompt=16,
+            min_labels_in_prompt=4,
+            seed=args.seed + 13,
+        )
+        if eval_examples is not None
+        else None
+    )
 
     model_dtype = (
         torch.bfloat16 if args.bf16 else torch.float16 if args.fp16 else torch.float32
@@ -607,6 +686,7 @@ def train(args: argparse.Namespace) -> None:
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
+        callbacks=[EpochRandomizationCallback(train_dataset)],
     )
 
     logger.info(
