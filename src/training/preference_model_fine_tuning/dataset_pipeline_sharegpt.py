@@ -55,6 +55,13 @@ class RoutePolicySample:
 
 
 @dataclass
+class RoutePolicySampleWithLabelSpace:
+    sample_id: str
+    truth_policy: RoutePolicy
+    negative_policies: List[RoutePolicy]
+
+
+@dataclass
 class RoutePolicy:
     label: str
     description: str
@@ -182,37 +189,22 @@ class ShareGPTPreferencePipeline:
 
     async def run(
         self,
-        existing_policy_label_path: Path,
         input_dataset_path: Path,
         output_path: Path,
     ) -> Path:
         """Execute the full pipeline and return the output path."""
-        all_policy_candidates: List[RoutePolicy] = self._load_existing_policies(
-            existing_policy_label_path
-        )
         batch_count = 0
         start_index = self.start_sample_index
         for batch in self._get_one_batch(input_dataset_path, start_index):
             batch_count += 1
             logging.info(f"Processing batch {batch_count} of size {len(batch)}")
-            (
-                added_policies,
-                policy_label_candidates,
-            ) = await self.generate_policy_label_for_batch(batch, all_policy_candidates)
-            all_policy_candidates.extend(added_policies)
+            policy_label_candidates = await self.generate_policy_label_for_batch(batch)
+            # all_policy_candidates.extend(added_policies)
             # store the policy_label_candidate to local
             with open(output_path, "a") as f:
                 for candidate in policy_label_candidates:
                     f.write(json.dumps(candidate) + "\n")
             # write all policies to to existing_policy_label_path
-            with open(existing_policy_label_path, "w") as f:
-                for policy in all_policy_candidates:
-                    f.write(
-                        json.dumps(
-                            {"label": policy.label, "description": policy.description}
-                        )
-                        + "\n"
-                    )
         return output_path
 
     # --------------------------- dataset utilities -------------------------
@@ -266,19 +258,16 @@ class ShareGPTPreferencePipeline:
     async def generate_policy_label_for_batch(
         self,
         batch: List[ShareGPTConversation],
-        existing_policies: List[RoutePolicy],
-    ) -> Tuple[List[RoutePolicy], List[Dict[str, str]]]:
+    ) -> List[Dict[str, any]]:
         """Generate policy labels by querying each conversation concurrently."""
 
         tasks = [
-            asyncio.to_thread(
-                self._request_policy_label, conversation, existing_policies
-            )
+            asyncio.to_thread(self._request_policy_label, conversation)
             for conversation in batch
         ]
         raw_candidates = await asyncio.gather(*tasks, return_exceptions=True)
 
-        policy_label_candidates: List[Dict[str, str]] = []
+        policy_label_candidates: List[Dict[str, any]] = []
         for conversation, candidate in zip(batch, raw_candidates):
             if isinstance(candidate, Exception):
                 logging.error(
@@ -300,59 +289,72 @@ class ShareGPTPreferencePipeline:
             json.dumps(policy_label_candidates),
         )
 
-        all_valid_sample_ids = {convo.sample_id for convo in batch}
-        valid_policy_label_candidates: List[Dict[str, str]] = []
-        new_policies: List[RoutePolicy] = []
-        for candidate in policy_label_candidates:
-            sample_id = candidate.get("sample_id", "").strip()
-            label = candidate.get("label", "").strip()
-            description = candidate.get("description", "").strip()
-            if sample_id not in all_valid_sample_ids:
-                logging.warning(
-                    "Skipping unknown sample_id in candidate: %s",
-                    json.dumps(candidate),
-                )
-                continue
-            if not label:
-                logging.warning(
-                    "Skipping empty label in candidate: %s",
-                    json.dumps(candidate),
-                )
-                continue
-            valid_policy_label_candidates.append(candidate)
-            if any(p.label == label for p in existing_policies + new_policies):
-                logging.info("Skipping duplicate label: %s", label)
-                continue
-            new_policies.append(RoutePolicy(label=label, description=description))
-        return new_policies, valid_policy_label_candidates
+        # all_valid_sample_ids = {convo.sample_id for convo in batch}
+        # valid_policy_label_candidates: List[Dict[str, str]] = []
+        # new_policies: List[RoutePolicy] = []
+        # for candidate in policy_label_candidates:
+        #     sample_id = candidate.get("sample_id", "").strip()
+        #     label = candidate.get("label", "").strip()
+        #     description = candidate.get("description", "").strip()
+        #     if sample_id not in all_valid_sample_ids:
+        #         logging.warning(
+        #             "Skipping unknown sample_id in candidate: %s",
+        #             json.dumps(candidate),
+        #         )
+        #         continue
+        #     if not label:
+        #         logging.warning(
+        #             "Skipping empty label in candidate: %s",
+        #             json.dumps(candidate),
+        #         )
+        #         continue
+        #     valid_policy_label_candidates.append(candidate)
+        #     if any(p.label == label for p in existing_policies + new_policies):
+        #         logging.info("Skipping duplicate label: %s", label)
+        #         continue
+        #     new_policies.append(RoutePolicy(label=label, description=description))
+        return policy_label_candidates
 
     def _request_policy_label(
         self,
         conversation: ShareGPTConversation,
-        existing_policies: List[RoutePolicy],
     ) -> Optional[Dict[str, str]]:
         """Issue a single policy label request for one conversation."""
 
-        prompt = self._build_policy_label_prompt(
-            conversation, existing_policies=existing_policies
-        )
+        prompt = self._build_policy_label_prompt(conversation)
         response_payload = self.policy_label_model.chat(
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
             response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "RoutePolicySample",
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "sample_id": {"type": "string"},
-                            "label": {"type": "string"},
-                            "description": {"type": "string"},
+                "name": "route_policy_sample",
+                "schema": {
+                    "type": "object",
+                    "required": ["sample_id", "truth_policy", "negative_policies"],
+                    "properties": {
+                        "sample_id": {"type": "string"},
+                        "truth_policy": {
+                            "type": "object",
+                            "required": ["label", "description"],
+                            "properties": {
+                                "label": {"type": "string"},
+                                "description": {"type": "string"},
+                            },
+                            "additionalProperties": False,
                         },
-                        "required": ["sample_id", "label", "description"],
-                        "additionalProperties": False,
+                        "negative_policies": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["label", "description"],
+                                "properties": {
+                                    "label": {"type": "string"},
+                                    "description": {"type": "string"},
+                                },
+                                "additionalProperties": False,
+                            },
+                        },
                     },
+                    "additionalProperties": False,
                 },
             },
         )
@@ -379,26 +381,31 @@ class ShareGPTPreferencePipeline:
             return None
         return candidate
 
-    def _build_policy_label_prompt(
-        self, conversation: ShareGPTConversation, existing_policies: list[RoutePolicy]
-    ) -> str:
+    def _build_policy_label_prompt(self, conversation: ShareGPTConversation) -> str:
         conversation_json = json.dumps(conversation.to_dict(), indent=2)
-        return f"""You are an expert at summarizing user intents into concise routing policy labels.
-Given the following single conversation, generate a short generalized label that best describes the user's intent for routing purposes.
+        return (
+            """You are an expert at summarizing user intents into concise routing policy labels.
+            Given the following single conversation, generate a short generalized label that best describes the user's intent for routing purposes.
+            Then, generate 16 negative labels that are plausible but do not match the conversation.
 
-### Instructions
-Return exactly one JSON object in the format:
-{{"sample_id": <sample_id>, "label": <label>, "description": <brief description on the generalized label, not on the specific conversation>}}
-Copy the sample_id faithfully from the input conversation.
-The label should consist of a "domain" (e.g. legal, finance) plus an "action" (e.g. summarization, inquiry, code_generation) so it can generalize to similar conversations.
-Try to make the label (both domain and action) general enough. If there's no specific domain, use "general" as the domain.
-### Current Policy Labels
-Try to reuse one of the existing policy labels if it fits well.
-{json.dumps([policy.label for policy in existing_policies])}
+            ### Instructions
+            Return exactly one JSON object in the format:
+            { "sample_id": str, "truth_policy": {"label": str, "description": str}, "negative_policies": [{"label": str, "description": str}]}
+            Copy the sample_id faithfully from the input conversation.
+            The label should consist of a "domain" (e.g. legal, finance) plus an "action" (e.g. summarization, inquiry, code_generation) so it can generalize to similar conversations.
+            Try to make the label (both domain and action) general enough.
+            ### Policy Labels Examples
+            - "code_generation"
+            - "creative_writing"
+            - "text_summarization"
+            - "math_problem_solving"
+            - "legal_inquiry"
+            - "medical_inquiry"
 
-### Conversation
-{conversation_json}
-"""
+            ### Conversation
+            """
+            + conversation_json
+        )
 
     def refine(
         self,
@@ -650,31 +657,30 @@ def main() -> None:
 
     existing_policy_label_path = Path("existing_sharegpt_policies_2.jsonl")
     dataset_path = Path("ShareGPT_V3_unfiltered_cleaned_split.json")
-    output_path = Path("sharegpt_preference_labeled_2.jsonl")
+    output_path = Path("sharegpt_preference_labeled_with_negative.jsonl")
     refined_dataset_path = Path("label_canonical_map.json")
-    # asyncio.run(
-    #     pipeline.run(
-    #         existing_policy_label_path=existing_policy_label_path,
-    #         input_dataset_path=dataset_path,
-    #         output_path=output_path,
-    #     )
-    # )
+    asyncio.run(
+        pipeline.run(
+            input_dataset_path=dataset_path,
+            output_path=output_path,
+        )
+    )
     # pipeline.refine(
     #     refined_dataset_path=refined_dataset_path,
     #     existing_policy_label_path=existing_policy_label_path,
     #     input_dataset_path=output_path,
     #     batch_size=1000,
     # )
-    asyncio.run(
-        pipeline.verify_policies(
-            original_dataset_path=dataset_path,
-            input_dataset_path=output_path,
-            refined_dataset_path=refined_dataset_path,
-            output_path=Path("verified_sharegpt_policy_labels_2.jsonl"),
-            batch_size=20,
-            start_index=34066,
-        )
-    )
+    # asyncio.run(
+    #     pipeline.verify_policies(
+    #         original_dataset_path=dataset_path,
+    #         input_dataset_path=output_path,
+    #         refined_dataset_path=refined_dataset_path,
+    #         output_path=Path("verified_sharegpt_policy_labels_2.jsonl"),
+    #         batch_size=20,
+    #         start_index=34066,
+    #     )
+    # )
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
