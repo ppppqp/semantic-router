@@ -342,24 +342,15 @@ class ShareGPTPreferencePipeline:
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
             response_format={
-                "name": "route_policy_sample",
-                "schema": {
-                    "type": "object",
-                    "required": ["sample_id", "truth_policy", "negative_policies"],
-                    "properties": {
-                        "sample_id": {"type": "string"},
-                        "truth_policy": {
-                            "type": "object",
-                            "required": ["label", "description"],
-                            "properties": {
-                                "label": {"type": "string"},
-                                "description": {"type": "string"},
-                            },
-                            "additionalProperties": False,
-                        },
-                        "negative_policies": {
-                            "type": "array",
-                            "items": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "route_policy_sample",
+                    "schema": {
+                        "type": "object",
+                        "required": ["sample_id", "truth_policy", "negative_policies"],
+                        "properties": {
+                            "sample_id": {"type": "string"},
+                            "truth_policy": {
                                 "type": "object",
                                 "required": ["label", "description"],
                                 "properties": {
@@ -368,9 +359,21 @@ class ShareGPTPreferencePipeline:
                                 },
                                 "additionalProperties": False,
                             },
+                            "negative_policies": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "required": ["label", "description"],
+                                    "properties": {
+                                        "label": {"type": "string"},
+                                        "description": {"type": "string"},
+                                    },
+                                    "additionalProperties": False,
+                                },
+                            },
                         },
+                        "additionalProperties": False,
                     },
-                    "additionalProperties": False,
                 },
             },
         )
