@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
-from training.preference_model_fine_tuning.preference_model_ft_reranking import (
+from preference_model_ft_reranking import (
     CATCH_ALL_LABEL,
     build_prompt,
     build_training_examples,
@@ -42,6 +42,7 @@ from dataset_pipeline_sharegpt import RoutePolicy
 
 @dataclass
 class EvalExample:
+    sample_id: str
     prompt_ids: List[int]
     label: str
     candidate_policies: Optional[List[RoutePolicy]] = None
@@ -59,9 +60,9 @@ def build_eval_examples(
     examples: List[EvalExample] = []
     for example in training_examples:
         label_space = [policy for policy in example.negative_policies]
-        label_space.append(
-            RoutePolicy(label=CATCH_ALL_LABEL, description="None of the above")
-        )
+        # label_space.append(
+        #     RoutePolicy(label=CATCH_ALL_LABEL, description="None of the above")
+        # )
         if not all_negative:
             label_space.append(example.truth_policy)
         # TODO: vary label size
@@ -74,6 +75,7 @@ def build_eval_examples(
         )
         examples.append(
             EvalExample(
+                sample_id=example.conversation.sample_id,
                 prompt_ids=prompt_encoding,
                 label=(
                     example.truth_policy.label if not all_negative else CATCH_ALL_LABEL
@@ -98,33 +100,33 @@ def evaluate_generative(
     temperature: float,
     top_p: float,
     device: torch.device,
-    all_negative: bool,
 ) -> float:
     model.eval()
     correct = 0
     for ex in examples:
-        inputs = tokenizer(ex.prompt, return_tensors="pt", truncation=True)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+        input_ids = torch.tensor([ex.prompt_ids], device=device)
         with torch.no_grad():
             gen = model.generate(
-                **inputs,
+                input_ids=input_ids,
                 max_new_tokens=max_new_tokens,
                 do_sample=temperature > 0,
                 temperature=temperature if temperature > 0 else None,
                 top_p=top_p,
                 eos_token_id=tokenizer.eos_token_id,
             )
-        generated_tokens = gen[0][inputs["input_ids"].shape[1] :]
+        generated_tokens = gen[0][input_ids.shape[1] :]
         output_text = _normalize(
             tokenizer.decode(generated_tokens, skip_special_tokens=True)
         )
-        expected_label = ex.label if not all_negative else CATCH_ALL_LABEL
+        expected_label = ex.label
         if expected_label == output_text:
             correct += 1
         else:
             # log the first 5 mismatches
             if correct < 5:
-                logging.info(f"Mismatch: expected '{ex.label}', got '{output_text}'")
+                logging.info(
+                    f"Mismatch: {ex.sample_id} expected '{ex.label}', got '{output_text}'"
+                )
     return correct / len(examples) if examples else 0.0
 
 
@@ -188,7 +190,7 @@ def evaluate_rerank(
             # log the first 5 mismatches
             if correct < 5:
                 logging.info(
-                    f"Rerank mismatch: expected '{ex.label}', got '{scores[0][0]}'"
+                    f"Rerank mismatch: {ex.sample_id} expected '{ex.label}', got '{scores[0][0]}'"
                 )
     return correct / used if used else 0.0
 
@@ -200,17 +202,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset-path",
         type=Path,
-        required=True,
         help="JSONL dataset with prompt/label (+candidates for rerank)",
         default="ShareGPT_V3_unfiltered_cleaned_split.json",
     )
     parser.add_argument(
-        "--model-name", type=str, required=True, help="HF model name or local path"
+        "--model-name", type=str, default="preference_model_qwen3_rerank"
     )
     parser.add_argument(
         "--label-map-path",
         type=Path,
-        required=True,
         default="sharegpt_preference_labeled_with_negative.jsonl",
     )
     parser.add_argument(
@@ -220,7 +220,7 @@ def parse_args() -> argparse.Namespace:
         help="Evaluation mode",
     )
     parser.add_argument(
-        "--max-samples", type=int, default=None, help="Limit number of examples"
+        "--max-samples", type=int, default=100, help="Limit number of examples"
     )
     parser.add_argument(
         "--max-new-tokens",
@@ -250,6 +250,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--all-negative",
         action="store_true",
+        default=False,
         help="Use all-negative candidate policies (no positive) for rerank eval",
     )
     return parser.parse_args()
@@ -277,10 +278,12 @@ def main() -> None:  # pragma: no cover - CLI helper
         label_map_path=args.label_map_path,
         max_samples=None,
     )
+    rng = np.random.default_rng(seed=42)
     examples = build_eval_examples(
         training_examples,
         tokenizer=tokenizer,
         max_samples=args.max_samples,
+        rng=rng,
         all_negative=args.all_negative,
     )
     if not examples:

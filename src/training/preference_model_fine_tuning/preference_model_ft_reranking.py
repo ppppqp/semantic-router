@@ -290,7 +290,7 @@ class ChatAlignedDataset(TorchDataset):
         example = self.examples[idx]
         rng = self._rng_for_idx(idx)
 
-        all_negative = rng.random() < 0.1
+        all_negative = rng.random() < float(1 / self.max_labels_in_prompt)
         label_space = (
             [example.truth_policy] + example.negative_policies
             if not all_negative
