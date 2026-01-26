@@ -118,6 +118,13 @@ def evaluate_generative(
         output_text = _normalize(
             tokenizer.decode(generated_tokens, skip_special_tokens=True)
         )
+        label_set = (
+            {policy.label for policy in ex.candidate_policies}
+            if ex.candidate_policies
+            else set()
+        )
+        if output_text not in label_set:
+            output_text = CATCH_ALL_LABEL
         expected_label = ex.label
         if expected_label == output_text:
             correct += 1
@@ -206,12 +213,15 @@ def parse_args() -> argparse.Namespace:
         default="ShareGPT_V3_unfiltered_cleaned_split.json",
     )
     parser.add_argument(
-        "--model-name", type=str, default="preference_model_qwen3_rerank"
+        # "--model-name", type=str, default="Qwen/Qwen3-0.6B"
+        "--model-name",
+        type=str,
+        default="preference_model_qwen3_rerank",
     )
     parser.add_argument(
         "--label-map-path",
         type=Path,
-        default="sharegpt_preference_labeled_with_negative.jsonl",
+        default="sharegpt_preference_labeled_with_negative_validation.jsonl",
     )
     parser.add_argument(
         "--mode",
@@ -220,7 +230,7 @@ def parse_args() -> argparse.Namespace:
         help="Evaluation mode",
     )
     parser.add_argument(
-        "--max-samples", type=int, default=100, help="Limit number of examples"
+        "--max-samples", type=int, default=None, help="Limit number of examples"
     )
     parser.add_argument(
         "--max-new-tokens",
