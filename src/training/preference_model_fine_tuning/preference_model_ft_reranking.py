@@ -311,7 +311,7 @@ class ChatAlignedDataset(TorchDataset):
         )
 
         label_ids = self.tokenizer(
-            f"{example.truth_policy if not all_negative else CATCH_ALL_LABEL}<|im_end|>",
+            f"{example.truth_policy.label if not all_negative else CATCH_ALL_LABEL}<|im_end|>",
             add_special_tokens=False,
             truncation=False,
         )["input_ids"]
