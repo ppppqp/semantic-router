@@ -33,10 +33,12 @@ from preference_model_ft_reranking import (
     CATCH_ALL_LABEL,
     build_prompt,
     build_training_examples,
+    generate_random_label_name,
 )
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
 
 from dataset_pipeline_sharegpt import RoutePolicy
+from preference_mmlu_dataset import build_clinc150_training_examples
 
 
 @dataclass
@@ -44,6 +46,7 @@ class EvalExample:
     sample_id: str
     prompt_ids: List[int]
     label: str
+    label_name_mapping: dict[str, str]
     candidate_policies: Optional[List[RoutePolicy]] = None
 
 
@@ -66,8 +69,12 @@ def build_eval_examples(
             label_space.append(example.truth_policy)
         # TODO: vary label size
         randomized_label_space = rng.permutation(list(label_space)).tolist()
+        label_name_mapping = {}
+        for policy in randomized_label_space:
+            label_name_mapping[policy.label] = generate_random_label_name(rng)
         prompt_encoding = build_prompt(
             conversation=example.conversation,
+            label_name_mapping=label_name_mapping,
             label_space=randomized_label_space,
             tokenizer=tokenizer,
             max_length=max_length,
@@ -79,6 +86,7 @@ def build_eval_examples(
                 label=(
                     example.truth_policy.label if not all_negative else CATCH_ALL_LABEL
                 ),
+                label_name_mapping=label_name_mapping,
                 candidate_policies=randomized_label_space,
             )
         )
@@ -118,21 +126,32 @@ def evaluate_generative(
             tokenizer.decode(generated_tokens, skip_special_tokens=True)
         )
         label_set = (
-            {policy.label for policy in ex.candidate_policies}
+            {
+                ex.label_name_mapping.get(policy.label, policy.label)
+                for policy in ex.candidate_policies
+            }
             if ex.candidate_policies
             else set()
         )
-        if output_text not in label_set:
-            output_text = CATCH_ALL_LABEL
-        expected_label = ex.label
+        # if output_text not in label_set:
+        #     output_text = ex.label_name_mapping.get(CATCH_ALL_LABEL, CATCH_ALL_LABEL)
+        expected_label = ex.label_name_mapping.get(ex.label, ex.label)
+
+        # find reverse mapping to orignal label
+        output_label_pre_mapped = None
+        for original_label, mapped_label in ex.label_name_mapping.items():
+            if mapped_label == output_text:
+                output_label_pre_mapped = original_label
+                break
+
         if expected_label == output_text:
             correct += 1
         else:
             # log the first 5 mismatches
-            if correct < 5:
-                logging.info(
-                    f"Mismatch: {ex.sample_id} expected '{ex.label}', got '{output_text}'"
-                )
+            # if correct < 5:
+            logging.info(
+                f"Mismatch: {ex.sample_id} expected '{ex.label}', got '{output_label_pre_mapped}'"
+            )
     return correct / len(examples) if examples else 0.0
 
 
@@ -141,6 +160,7 @@ def score_labels(
     tokenizer: PreTrainedTokenizerBase,
     prompt_ids: List[int],
     candidate_policies: Sequence[RoutePolicy],
+    label_mapping: dict[str, str],
     device: torch.device,
     max_length: Optional[int] = None,
 ) -> List[Tuple[str, float]]:
@@ -149,7 +169,9 @@ def score_labels(
     scores: List[Tuple[str, float]] = []
     for policy in candidate_policies:
         label_ids = tokenizer(
-            f"{policy.label}<|im_end|>", add_special_tokens=False, truncation=False
+            f"{label_mapping.get(policy.label, policy.label)}<|im_end|>",
+            add_special_tokens=False,
+            truncation=False,
         )["input_ids"]
         if max_length and len(prompt_ids) + len(label_ids) > max_length:
             continue
@@ -179,11 +201,13 @@ def evaluate_rerank(
     for ex in examples:
         if not ex.candidate_policies:
             continue
+        label_mapping = ex.label_name_mapping
         scores = score_labels(
             model=model,
             tokenizer=tokenizer,
             prompt_ids=ex.prompt_ids,
             candidate_policies=ex.candidate_policies,
+            label_mapping=label_mapping,
             device=device,
             max_length=max_length,
         )
@@ -194,10 +218,10 @@ def evaluate_rerank(
             correct += 1
         else:
             # log the first 5 mismatches
-            if correct < 5:
-                logging.info(
-                    f"Rerank mismatch: {ex.sample_id} expected '{ex.label}', got '{scores[0][0]}'"
-                )
+            # if correct < 5:
+            logging.info(
+                f"Rerank mismatch: {ex.sample_id} expected '{ex.label}', got '{scores[0][0]}'"
+            )
     return correct / used if used else 0.0
 
 
@@ -282,11 +306,12 @@ def main() -> None:  # pragma: no cover - CLI helper
         args.model_name, trust_remote_code=True
     ).to(device)
 
-    training_examples = build_training_examples(
-        dataset_path=args.dataset_path,
-        label_map_path=args.label_map_path,
-        max_samples=None,
-    )
+    # training_examples = build_training_examples(
+    #     dataset_path=args.dataset_path,
+    #     label_map_path=args.label_map_path,
+    #     max_samples=None,
+    # )
+    training_examples = build_clinc150_training_examples()
     rng = np.random.default_rng(seed=42)
     examples = build_eval_examples(
         training_examples,

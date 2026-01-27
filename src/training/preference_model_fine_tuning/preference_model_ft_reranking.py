@@ -250,15 +250,9 @@ def sample_label_space(
 
 
 def generate_random_label_name(rng: np.random.Generator) -> str:
-    style = rng.choice(["letter", "alnum", "intent"])
-
-    if style == "letter":
-        return rng.choice(string.ascii_uppercase)
-
-    if style == "alnum":
-        return rng.choice(string.ascii_uppercase) + str(rng.randint(0, 99))
-
-    return f"intent_{rng.randint(0, 9999)}"
+    # chose a random label name like "alpha1234"
+    prefix = "".join(rng.choice(list(string.ascii_lowercase), size=5))
+    return prefix + str(rng.integers(0, 9999))
 
 
 class ChatAlignedDataset(TorchDataset):
@@ -348,6 +342,8 @@ class ChatAlignedDataset(TorchDataset):
 
         full_encoding: List[int] = prompt_encoding + label_ids
 
+        # DEBUG;
+        # print(self.tokenizer.decode(full_encoding, skip_special_tokens=True))
         labels = full_encoding.copy()
         for i in range(len(prompt_encoding)):
             labels[i] = -100
