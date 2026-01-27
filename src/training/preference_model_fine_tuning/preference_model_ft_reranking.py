@@ -13,7 +13,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
-
+import string
 import numpy as np
 import torch
 from transformers import (
@@ -33,7 +33,7 @@ CATCH_ALL_LABEL = "none_of_the_above"
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a routing controller that reads a conversation and outputs "
-    f"the best preference label for downstream model routing. If none of the labels apply, respond with '{CATCH_ALL_LABEL}'\n"
+    "the best preference label for downstream model routing.\n"
 )
 
 
@@ -157,13 +157,16 @@ def conversation_to_text(conversation: ShareGPTConversation) -> str:
 def build_prompt(
     conversation: ShareGPTConversation,
     label_space: Sequence[RoutePolicy],
+    label_name_mapping: Dict[str, str],
     tokenizer: PreTrainedTokenizerBase,
     max_length: int,
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
 ) -> List[int]:
     label_clauses = []
     for policy in label_space:
-        label_clauses.append(f"- {policy.label}: {policy.description}")
+        label_clauses.append(
+            f"- {label_name_mapping.get(policy.label, policy.label)}: {policy.description}"
+        )
     label_clause = "\n".join(label_clauses)
 
     convo_text = conversation_to_text(conversation)
@@ -224,7 +227,7 @@ def build_prompt(
     ]
 
 
-def get_random_label_space(
+def sample_label_space(
     available_labels: List[RoutePolicy],
     max_labels_in_prompt: int,
     min_labels_in_prompt: int,
@@ -243,8 +246,19 @@ def get_random_label_space(
         else int(rng.integers(lower_bound, upper_bound + 1))
     )
     sampled = rng.choice(available_labels, size=sample_size, replace=False)
-    randomized_label_space = rng.permutation(list(sampled)).tolist()
-    return randomized_label_space
+    return sampled.tolist()
+
+
+def generate_random_label_name(rng: np.random.Generator) -> str:
+    style = rng.choice(["letter", "alnum", "intent"])
+
+    if style == "letter":
+        return rng.choice(string.ascii_uppercase)
+
+    if style == "alnum":
+        return rng.choice(string.ascii_uppercase) + str(rng.randint(0, 99))
+
+    return f"intent_{rng.randint(0, 9999)}"
 
 
 class ChatAlignedDataset(TorchDataset):
@@ -291,27 +305,43 @@ class ChatAlignedDataset(TorchDataset):
         rng = self._rng_for_idx(idx)
 
         all_negative = rng.random() < float(1 / self.max_labels_in_prompt)
-        label_space = (
-            [example.truth_policy] + example.negative_policies
-            if not all_negative
-            else example.negative_policies
+        catch_all_label = RoutePolicy(
+            label=CATCH_ALL_LABEL, description="None of the above matches"
         )
-        random_label_space = get_random_label_space(
-            available_labels=label_space,
+        sampled_label_space = sample_label_space(
+            available_labels=example.negative_policies,
             max_labels_in_prompt=self.max_labels_in_prompt,
             min_labels_in_prompt=self.min_labels_in_prompt,
             rng=rng,
         )
+        # always include the catch all label
+        if all_negative:
+            sampled_label_space.append(catch_all_label)
+        else:
+            # if not all negative, include truth label
+            sampled_label_space.extend([example.truth_policy, catch_all_label])
+
+        random_label_space: list[RoutePolicy] = rng.permutation(
+            sampled_label_space
+        ).tolist()
+
+        # generate random label names to avoid ontology overfitting
+        label_name_mapping = {}
+        for policy in random_label_space:
+            label_name_mapping[policy.label] = generate_random_label_name(rng)
 
         prompt_encoding = build_prompt(
             conversation=example.conversation,
             label_space=random_label_space,
+            label_name_mapping=label_name_mapping,
             tokenizer=self.tokenizer,
             max_length=self.max_length,
         )
-
+        truth_label = (
+            example.truth_policy.label if not all_negative else CATCH_ALL_LABEL
+        )
         label_ids = self.tokenizer(
-            f"{example.truth_policy.label if not all_negative else CATCH_ALL_LABEL}<|im_end|>",
+            f"{label_name_mapping[truth_label]}<|im_end|>",
             add_special_tokens=False,
             truncation=False,
         )["input_ids"]
@@ -390,50 +420,6 @@ class LabelPaddingCollator:
 
         batch["labels"] = torch.tensor(padded_labels, dtype=torch.long)
         return batch
-
-
-def score_labels(
-    model: AutoModelForCausalLM,
-    tokenizer: PreTrainedTokenizerBase,
-    conversation: ShareGPTConversation,
-    candidate_labels: Sequence[str],
-    max_length: int,
-    device: Optional[torch.device] = None,
-) -> List[Tuple[str, float]]:
-    device = device or model.device
-
-    prompt_ids = build_prompt(
-        conversation=conversation,
-        label_space=candidate_labels,
-        tokenizer=tokenizer,
-        max_length=max_length,
-    )
-
-    scores: List[Tuple[str, float]] = []
-    for label in candidate_labels:
-        label_ids = tokenizer(
-            f"{label}<|im_end|>", add_special_tokens=False, truncation=False
-        )["input_ids"]
-        if len(prompt_ids) + len(label_ids) > max_length:
-            continue
-
-        input_ids = torch.tensor([prompt_ids + label_ids], device=device)
-        attention_mask = torch.ones_like(input_ids)
-
-        with torch.no_grad():
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            logits = outputs.logits
-
-        log_probs = torch.nn.functional.log_softmax(logits[:, :-1, :], dim=-1)
-        start = len(prompt_ids) - 1
-        label_len = len(label_ids)
-        token_positions = log_probs[0, start : start + label_len, :]
-        target = torch.tensor(label_ids, device=device)
-        token_log_probs = token_positions.gather(1, target.unsqueeze(1)).squeeze(1)
-        scores.append((label, float(token_log_probs.sum().item())))
-
-    scores.sort(key=lambda x: x[1], reverse=True)
-    return scores
 
 
 def parse_args() -> argparse.Namespace:
@@ -699,23 +685,6 @@ def train(args: argparse.Namespace) -> None:
     trainer.save_model(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
     logger.info("Model and tokenizer saved to %s", args.output_dir)
-
-    if args.candidate_labels and args.inference_sample_index is not None:
-        candidate_labels = [
-            label.strip() for label in args.candidate_labels.split(",") if label.strip()
-        ]
-        if candidate_labels:
-            example = examples[min(args.inference_sample_index, len(examples) - 1)]
-            scores = score_labels(
-                model=model,
-                tokenizer=tokenizer,
-                conversation=example.conversation,
-                candidate_labels=candidate_labels,
-                max_length=args.max_length,
-            )
-            logger.info(
-                "Rerank demo for sample %s: %s", example.conversation.sample_id, scores
-            )
 
 
 def main() -> None:  # pragma: no cover - CLI helper

@@ -23,7 +23,6 @@ preference_model_ft_reranking.py.
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,9 +59,9 @@ def build_eval_examples(
     examples: List[EvalExample] = []
     for example in training_examples:
         label_space = [policy for policy in example.negative_policies]
-        # label_space.append(
-        #     RoutePolicy(label=CATCH_ALL_LABEL, description="None of the above")
-        # )
+        label_space.append(
+            RoutePolicy(label=CATCH_ALL_LABEL, description="None of the above")
+        )
         if not all_negative:
             label_space.append(example.truth_policy)
         # TODO: vary label size
