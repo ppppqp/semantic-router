@@ -26,7 +26,12 @@ from transformers import (
 )
 from torch.utils.data import Dataset as TorchDataset
 
-from dataset_pipeline_sharegpt import ShareGPTConversation, Turn, RoutePolicy
+from dataset_pipeline_sharegpt import (
+    ShareGPTConversation,
+    Turn,
+    RoutePolicy,
+    get_sample_id_hash,
+)
 
 
 CATCH_ALL_LABEL = "none_of_the_above"
@@ -45,24 +50,10 @@ class PreferenceTrainingExample:
 
 
 def _load_label_mapping(path: Path) -> Dict[str, Tuple[RoutePolicy, List[RoutePolicy]]]:
+    # expect a jsonl file with sample_id, truth_policy, negative_policies
     if not path.exists():
         raise FileNotFoundError(f"Label mapping file not found: {path}")
-
-    if path.suffix == ".json":
-        payload = json.loads(path.read_text())
-        if isinstance(payload, dict):
-            return {str(k): str(v) for k, v in payload.items()}
-        if isinstance(payload, list):
-            mapping: Dict[str, str] = {}
-            for item in payload:
-                sample_id = str(item.get("sample_id"))
-                label = item.get("label")
-                if sample_id and label:
-                    mapping[sample_id] = str(label)
-            return mapping
-        raise ValueError("Unsupported JSON label mapping format.")
-
-    mapping: Dict[str, str] = {}
+    mapping: Dict[str, Tuple[RoutePolicy, List[RoutePolicy]]] = {}
     with open(path, "r") as f:
         for line in f:
             line = line.strip()
@@ -124,7 +115,8 @@ def build_training_examples(
         if idx < start_index:
             continue
         policy_pairs = label_mapping.get(conversation.sample_id)
-
+        # label_sample_id_hash = get_sample_id_hash(conversation.sample_id)
+        # policy_pairs = label_mapping.get(f"{label_sample_id_hash}_0")
         if not policy_pairs:
             continue
 
@@ -480,7 +472,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=24,
+        default=16,
         help="Per-device train batch size.",
     )
     parser.add_argument(
