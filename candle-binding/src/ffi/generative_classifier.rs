@@ -24,9 +24,6 @@ static GLOBAL_QWEN3_MULTI_CLASSIFIER: OnceLock<Mutex<Qwen3MultiLoRAClassifier>> 
 /// Global Qwen3Guard instance (for safety/jailbreak detection)
 static GLOBAL_QWEN3_GUARD: OnceLock<Mutex<Qwen3GuardModel>> = OnceLock::new();
 
-/// Global Qwen3 zero-shot classifier for preference routing
-static GLOBAL_QWEN3_PREFERENCE: OnceLock<Mutex<Qwen3MultiLoRAClassifier>> = OnceLock::new();
-
 /// Generative classification result returned to Go
 #[repr(C)]
 pub struct GenerativeClassificationResult {
@@ -907,7 +904,7 @@ pub extern "C" fn init_qwen3_preference_classifier(
     };
 
     // Avoid re-loading if already initialized
-    if GLOBAL_QWEN3_PREFERENCE.get().is_some() {
+    if GLOBAL_QWEN3_MULTI_CLASSIFIER.get().is_some() {
         println!("✅ Qwen3 preference classifier already initialized, reusing instance");
         return true;
     }
@@ -915,7 +912,7 @@ pub extern "C" fn init_qwen3_preference_classifier(
     let device = select_device(use_cpu);
 
     match Qwen3MultiLoRAClassifier::new(model_path_str, &device) {
-        Ok(classifier) => match GLOBAL_QWEN3_PREFERENCE.set(Mutex::new(classifier)) {
+        Ok(classifier) => match GLOBAL_QWEN3_MULTI_CLASSIFIER.set(Mutex::new(classifier)) {
             Ok(_) => true,
             Err(_) => {
                 println!("✅ Qwen3 preference classifier already initialized (race), reusing");
@@ -997,7 +994,7 @@ pub extern "C" fn classify_qwen3_preference(
         return default_result;
     }
 
-    let classifier_mutex = match GLOBAL_QWEN3_PREFERENCE.get() {
+    let classifier_mutex = match GLOBAL_QWEN3_MULTI_CLASSIFIER.get() {
         Some(c) => c,
         None => {
             eprintln!("Error: Qwen3 preference classifier not initialized");
