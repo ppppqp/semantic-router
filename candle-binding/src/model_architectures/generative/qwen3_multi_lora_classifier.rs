@@ -1057,38 +1057,21 @@ impl Qwen3MultiLoRAClassifier {
             }
         })?;
 
-        // Keep prompt tokens to reuse across category scoring
-        // TODO: remove prompt_ids since it's only used to get length
+        // Keep prompt tokens and length for batching
         let prompt_ids: Vec<u32> = prompt_encoding.get_ids().to_vec();
-        let prompt_token_ids = Tensor::new(prompt_encoding.get_ids(), &self.device)
-            .map_err(|e| UnifiedError::Processing {
-                operation: "create prompt tensor".to_string(),
-                source: e.to_string(),
-                input_context: None,
-            })?
-            .unsqueeze(0)
-            .map_err(|e| UnifiedError::Processing {
-                operation: "unsqueeze prompt tensor".to_string(),
-                source: e.to_string(),
-                input_context: None,
-            })?;
-
-        // base_logits is needed to predict the first category token
-        let base_logits =
-            self.base_model
-                .forward(&prompt_token_ids, 0)
-                .map_err(|e| UnifiedError::Model {
-                    model_type: crate::core::ModelErrorType::Embedding,
-                    operation: "forward prompt".to_string(),
-                    source: e.to_string(),
-                    context: None,
-                })?;
         let prompt_len = prompt_ids.len();
-        // Snapshot prompt KV cache so each category can start from the same state
-        let prompt_cache = self.base_model.kv_cache_snapshot();
+
+        if prompt_len == 0 {
+            return Err(UnifiedError::Processing {
+                operation: "validate prompt tokens".to_string(),
+                source: "Prompt produced no tokens".to_string(),
+                input_context: None,
+            });
+        }
 
         // Tokenize each category to full token sequences (handles multi-token labels)
         let mut category_token_seqs: Vec<Vec<u32>> = Vec::with_capacity(categories.len());
+        let mut max_label_len = 0usize;
         for category in &categories {
             let tokens = self
                 .tokenizer
@@ -1107,68 +1090,62 @@ impl Qwen3MultiLoRAClassifier {
                 });
             }
 
+            max_label_len = max_label_len.max(ids.len());
             category_token_seqs.push(ids.to_vec());
         }
-        // Compute log-probability for each category with a single forward per category,
-        // reusing the prompt KV cache.
-        let mut category_log_probs = Vec::with_capacity(categories.len());
+
+        let total_seq_len = prompt_len + max_label_len;
+        let batch_size = categories.len();
+        let mut batched_tokens: Vec<u32> = Vec::with_capacity(batch_size * total_seq_len);
+
+        for token_seq in &category_token_seqs {
+            batched_tokens.extend_from_slice(&prompt_ids);
+            batched_tokens.extend_from_slice(token_seq);
+
+            let pad_len = total_seq_len - (prompt_len + token_seq.len());
+            batched_tokens.extend(std::iter::repeat(0).take(pad_len));
+        }
+
+        // Single batched forward for all labels
+        let batched_input =
+            Tensor::from_vec(batched_tokens, (batch_size, total_seq_len), &self.device).map_err(
+                |e| UnifiedError::Processing {
+                    operation: "create batched tensor".to_string(),
+                    source: e.to_string(),
+                    input_context: None,
+                },
+            )?;
+
+        let logits = self
+            .base_model
+            .forward_all(&batched_input, 0)
+            .map_err(|e| UnifiedError::Model {
+                model_type: crate::core::ModelErrorType::Embedding,
+                operation: "batched forward".to_string(),
+                source: e.to_string(),
+                context: None,
+            })?;
+        // logits shape: [batch, total_seq_len, vocab]; score each label token
+        let mut category_log_probs = Vec::with_capacity(batch_size);
 
         for (cat_idx, token_seq) in category_token_seqs.iter().enumerate() {
-            // Restore prompt cache so each category starts from identical prefix state
-            self.base_model.kv_cache_restore(&prompt_cache);
-            let label_ids = Tensor::from_vec(token_seq.clone(), (1, token_seq.len()), &self.device)
-                .map_err(|e| UnifiedError::Processing {
-                    operation: "create label tensor".to_string(),
-                    source: e.to_string(),
-                    input_context: Some(format!("category={}", categories[cat_idx])),
-                })?;
-
-            // Forward all label tokens with prefix cache already populated
-            let logits = self
-                .base_model
-                .forward_all(&label_ids, prompt_len)
-                .map_err(|e| UnifiedError::Model {
-                    model_type: crate::core::ModelErrorType::Embedding,
-                    operation: "full forward".to_string(),
-                    source: e.to_string(),
-                    context: Some(format!("category={}", categories[cat_idx])),
-                })?;
-            // logits shape: [1, label_len, vocab]; score each label token
             let mut total_log_prob = 0f32;
             for (tok_idx, &token_id) in token_seq.iter().enumerate() {
-                // for first token, use base_logits from prompt forward
-                // for subsequent tokens, use logits from full forward, offset by 1
-                // TODO: clean this up
-                let step_logits = if tok_idx == 0 {
-                    base_logits
-                        .clone()
-                        .i((0, 0))
-                        .map_err(|e| UnifiedError::Processing {
-                            operation: "index batch".to_string(),
-                            source: e.to_string(),
-                            input_context: None,
-                        })?
-                        .to_dtype(DType::F32)
-                        .map_err(|e| UnifiedError::Processing {
-                            operation: "convert to f32".to_string(),
-                            source: e.to_string(),
-                            input_context: None,
-                        })?
-                } else {
-                    logits
-                        .i((0, tok_idx - 1))
-                        .map_err(|e| UnifiedError::Processing {
-                            operation: "index logits".to_string(),
-                            source: e.to_string(),
-                            input_context: Some(format!("category={}", categories[cat_idx])),
-                        })?
-                        .to_dtype(DType::F32)
-                        .map_err(|e| UnifiedError::Processing {
-                            operation: "convert logits to f32".to_string(),
-                            source: e.to_string(),
-                            input_context: Some(format!("category={}", categories[cat_idx])),
-                        })?
-                };
+                let logit_index = prompt_len + tok_idx - 1;
+                let step_logits = logits
+                    .i((cat_idx, logit_index))
+                    .map_err(|e| UnifiedError::Processing {
+                        operation: "index batched logits".to_string(),
+                        source: e.to_string(),
+                        input_context: Some(format!("category={}", categories[cat_idx])),
+                    })?
+                    .to_dtype(DType::F32)
+                    .map_err(|e| UnifiedError::Processing {
+                        operation: "convert logits to f32".to_string(),
+                        source: e.to_string(),
+                        input_context: Some(format!("category={}", categories[cat_idx])),
+                    })?;
+
                 let logits_vec =
                     step_logits
                         .to_vec1::<f32>()
@@ -1188,8 +1165,6 @@ impl Qwen3MultiLoRAClassifier {
                         input_context: Some(format!("category={}", categories[cat_idx])),
                     });
                 }
-                let logit = logits_vec[token_id as usize];
-                // for each label token, compute log-probability
                 let probs = softmax(&logits_vec);
                 let prob = probs[token_id as usize].max(f32::MIN_POSITIVE);
                 total_log_prob += prob.ln();
