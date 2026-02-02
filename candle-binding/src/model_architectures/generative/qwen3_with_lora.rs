@@ -400,23 +400,25 @@ impl Model {
         sw: Option<usize>,
     ) -> Result<Tensor> {
         let minf = f32::NEG_INFINITY;
-        let mask: Vec<_> = (0..tgt)
-            .flat_map(|i| {
-                (0..(tgt + offset)).map(move |j| {
+        // Build a batch-aware mask; previous version only built a single-batch mask and
+        // reshaped to (b, ...), which went out of bounds when b > 1.
+        let row_len = tgt + offset;
+        let mut mask: Vec<f32> = Vec::with_capacity(b * tgt * row_len);
+
+        for _batch in 0..b {
+            for i in 0..tgt {
+                for j in 0..row_len {
                     let past_ok = j <= i + offset;
                     let sw_ok = match sw {
                         Some(w) => (i + offset) as i64 - j as i64 <= w as i64,
                         None => true,
                     };
-                    if past_ok && sw_ok {
-                        0.
-                    } else {
-                        minf
-                    }
-                })
-            })
-            .collect();
-        Tensor::from_slice(&mask, (b, 1, tgt, tgt + offset), &self.device)?.to_dtype(self.dtype)
+                    mask.push(if past_ok && sw_ok { 0. } else { minf });
+                }
+            }
+        }
+
+        Tensor::from_slice(&mask, (b, 1, tgt, row_len), &self.device)?.to_dtype(self.dtype)
     }
 
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
