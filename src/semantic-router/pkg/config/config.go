@@ -3,6 +3,8 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
 )
@@ -34,6 +36,17 @@ const (
 	SignalTypeUserFeedback = "user_feedback"
 	SignalTypePreference   = "preference"
 	SignalTypeLanguage     = "language"
+	SignalTypeLatency      = "latency"
+	SignalTypeContext      = "context"
+	SignalTypeComplexity   = "complexity"
+)
+
+// API format constants for model backends
+const (
+	// APIFormatOpenAI is the default OpenAI-compatible API format (used by vLLM, etc.)
+	APIFormatOpenAI = "openai"
+	// APIFormatAnthropic is the Anthropic Messages API format (used by Claude models)
+	APIFormatAnthropic = "anthropic"
 )
 
 // RouterConfig represents the main configuration for the LLM Router
@@ -64,6 +77,8 @@ type RouterConfig struct {
 	SemanticCache `yaml:"semantic_cache"`
 	// Response API configuration for stateful conversations
 	ResponseAPI ResponseAPIConfig `yaml:"response_api"`
+	// Router Replay configuration for recording routing decisions
+	RouterReplay RouterReplayConfig `yaml:"router_replay"`
 	// Looper configuration for multi-model execution strategies
 	Looper LooperConfig `yaml:"looper,omitempty"`
 	// LLMObservability for LLM tracing, metrics, and logging
@@ -151,8 +166,178 @@ type IntelligentRouting struct {
 	// "confidence" - select decision with highest confidence score
 	Strategy string `yaml:"strategy,omitempty"`
 
+	// ModelSelection configures the algorithm used for model selection
+	// Supported methods: "static", "elo", "router_dc", "automix", "hybrid"
+	ModelSelection ModelSelectionConfig `yaml:"model_selection,omitempty"`
+
 	// Reasoning mode configuration
 	ReasoningConfig `yaml:",inline"`
+}
+
+// ModelSelectionConfig represents configuration for advanced model selection algorithms
+// Reference papers:
+//   - Elo: RouteLLM (arXiv:2406.18665) - Weighted Elo using Bradley-Terry model
+//   - RouterDC: Query-Based Router by Dual Contrastive Learning (arXiv:2409.19886)
+//   - AutoMix: Automatically Mixing Language Models (arXiv:2310.12963)
+//   - Hybrid: Cost-Efficient Quality-Aware Query Routing (arXiv:2404.14618)
+type ModelSelectionConfig struct {
+	// Method specifies the selection algorithm to use
+	// Options: "static", "elo", "router_dc", "automix", "hybrid"
+	// Default: "static" (uses static scores from configuration)
+	Method string `yaml:"method,omitempty"`
+
+	// Enabled indicates if model selection is enabled
+	Enabled bool `yaml:"enabled,omitempty"`
+
+	// Elo configuration for Elo rating-based selection
+	Elo EloSelectionConfig `yaml:"elo,omitempty"`
+
+	// RouterDC configuration for dual-contrastive learning selection
+	RouterDC RouterDCSelectionConfig `yaml:"router_dc,omitempty"`
+
+	// AutoMix configuration for POMDP-based cascaded routing
+	AutoMix AutoMixSelectionConfig `yaml:"automix,omitempty"`
+
+	// Hybrid configuration for combined selection methods
+	Hybrid HybridSelectionConfig `yaml:"hybrid,omitempty"`
+
+	// ML configuration for ML-based selection (KNN, KMeans, SVM)
+	ML MLSelectionConfig `yaml:"ml,omitempty"`
+}
+
+// MLSelectionConfig holds configuration for all ML-based selectors
+type MLSelectionConfig struct {
+	// ModelsPath is the base path for pretrained model files
+	ModelsPath string `yaml:"models_path,omitempty"`
+
+	// EmbeddingDim is the embedding dimension (default: 1024 for Qwen3)
+	EmbeddingDim int `yaml:"embedding_dim,omitempty"`
+
+	// KNN configuration
+	KNN MLKNNConfig `yaml:"knn,omitempty"`
+
+	// KMeans configuration
+	KMeans MLKMeansConfig `yaml:"kmeans,omitempty"`
+
+	// SVM configuration
+	SVM MLSVMConfig `yaml:"svm,omitempty"`
+}
+
+// MLKNNConfig holds KNN-specific configuration
+type MLKNNConfig struct {
+	K              int    `yaml:"k,omitempty"`
+	PretrainedPath string `yaml:"pretrained_path,omitempty"`
+}
+
+// MLKMeansConfig holds KMeans-specific configuration
+type MLKMeansConfig struct {
+	NumClusters      int     `yaml:"num_clusters,omitempty"`
+	EfficiencyWeight float64 `yaml:"efficiency_weight,omitempty"`
+	PretrainedPath   string  `yaml:"pretrained_path,omitempty"`
+}
+
+// MLSVMConfig holds SVM-specific configuration
+type MLSVMConfig struct {
+	Kernel         string  `yaml:"kernel,omitempty"`
+	Gamma          float64 `yaml:"gamma,omitempty"`
+	PretrainedPath string  `yaml:"pretrained_path,omitempty"`
+}
+
+// EloSelectionConfig configures Elo rating-based model selection
+type EloSelectionConfig struct {
+	// InitialRating is the starting Elo rating for new models (default: 1500)
+	InitialRating float64 `yaml:"initial_rating,omitempty"`
+
+	// KFactor controls rating volatility (default: 32)
+	KFactor float64 `yaml:"k_factor,omitempty"`
+
+	// CategoryWeighted enables per-category Elo ratings (default: true)
+	CategoryWeighted bool `yaml:"category_weighted,omitempty"`
+
+	// DecayFactor applies time decay to old comparisons (0-1, default: 0)
+	DecayFactor float64 `yaml:"decay_factor,omitempty"`
+
+	// MinComparisons before rating is considered stable (default: 5)
+	MinComparisons int `yaml:"min_comparisons,omitempty"`
+
+	// CostScalingFactor scales cost consideration (0 = ignore cost)
+	CostScalingFactor float64 `yaml:"cost_scaling_factor,omitempty"`
+
+	// StoragePath is the file path for persisting Elo ratings (optional)
+	// If set, ratings are loaded on startup and saved after each feedback update
+	StoragePath string `yaml:"storage_path,omitempty"`
+
+	// AutoSaveInterval is how often to auto-save ratings (e.g., "5m", "30s")
+	// Only used when StoragePath is set. Default: "1m"
+	AutoSaveInterval string `yaml:"auto_save_interval,omitempty"`
+}
+
+// RouterDCSelectionConfig configures dual-contrastive learning selection
+type RouterDCSelectionConfig struct {
+	// Temperature for softmax scaling (default: 0.07)
+	Temperature float64 `yaml:"temperature,omitempty"`
+
+	// DimensionSize for embeddings (default: 768)
+	DimensionSize int `yaml:"dimension_size,omitempty"`
+
+	// MinSimilarity threshold for valid matches (default: 0.3)
+	MinSimilarity float64 `yaml:"min_similarity,omitempty"`
+
+	// UseQueryContrastive enables query-side contrastive learning
+	UseQueryContrastive bool `yaml:"use_query_contrastive,omitempty"`
+
+	// UseModelContrastive enables model-side contrastive learning
+	UseModelContrastive bool `yaml:"use_model_contrastive,omitempty"`
+
+	// RequireDescriptions enforces that all models have descriptions
+	// When true, validation will fail if any model lacks a description
+	RequireDescriptions bool `yaml:"require_descriptions,omitempty"`
+
+	// UseCapabilities enables using structured capability tags for matching
+	// When true, capabilities are included in the embedding text
+	UseCapabilities bool `yaml:"use_capabilities,omitempty"`
+}
+
+// AutoMixSelectionConfig configures POMDP-based cascaded routing
+type AutoMixSelectionConfig struct {
+	// VerificationThreshold for self-verification (default: 0.7)
+	VerificationThreshold float64 `yaml:"verification_threshold,omitempty"`
+
+	// MaxEscalations limits escalation count (default: 2)
+	MaxEscalations int `yaml:"max_escalations,omitempty"`
+
+	// CostAwareRouting enables cost-quality tradeoff (default: true)
+	CostAwareRouting bool `yaml:"cost_aware_routing,omitempty"`
+
+	// CostQualityTradeoff balance (0 = quality, 1 = cost, default: 0.3)
+	CostQualityTradeoff float64 `yaml:"cost_quality_tradeoff,omitempty"`
+
+	// DiscountFactor for POMDP value iteration (default: 0.95)
+	DiscountFactor float64 `yaml:"discount_factor,omitempty"`
+
+	// UseLogprobVerification uses logprobs for confidence (default: true)
+	UseLogprobVerification bool `yaml:"use_logprob_verification,omitempty"`
+}
+
+// HybridSelectionConfig configures combined selection methods
+type HybridSelectionConfig struct {
+	// EloWeight for Elo rating contribution (0-1, default: 0.3)
+	EloWeight float64 `yaml:"elo_weight,omitempty"`
+
+	// RouterDCWeight for embedding similarity (0-1, default: 0.3)
+	RouterDCWeight float64 `yaml:"router_dc_weight,omitempty"`
+
+	// AutoMixWeight for POMDP value (0-1, default: 0.2)
+	AutoMixWeight float64 `yaml:"automix_weight,omitempty"`
+
+	// CostWeight for cost consideration (0-1, default: 0.2)
+	CostWeight float64 `yaml:"cost_weight,omitempty"`
+
+	// QualityGapThreshold triggers escalation (default: 0.1)
+	QualityGapThreshold float64 `yaml:"quality_gap_threshold,omitempty"`
+
+	// NormalizeScores before combination (default: true)
+	NormalizeScores bool `yaml:"normalize_scores,omitempty"`
 }
 
 type Signals struct {
@@ -180,6 +365,18 @@ type Signals struct {
 	// Language rules for multi-language detection signal classification
 	// When matched, outputs the detected language code (e.g., "en", "es", "zh", "fr")
 	LanguageRules []LanguageRule `yaml:"language_rules,omitempty"`
+
+	// Latency rules for latency-based signal classification
+	// When matched, outputs the latency rule name if available models meet TPOT requirements
+	LatencyRules []LatencyRule `yaml:"latency_rules,omitempty"`
+
+	// Context rules for token count-based classification
+	// When matched, outputs the rule name (e.g., "low_token_count", "high_token_count")
+	ContextRules []ContextRule `yaml:"context_rules,omitempty"`
+
+	// Complexity rules for complexity-based classification using embedding similarity
+	// When matched, outputs the rule name with difficulty level (e.g., "code_complexity:hard", "math_complexity:easy")
+	ComplexityRules []ComplexityRule `yaml:"complexity_rules,omitempty"`
 }
 
 // BackendModels represents the configuration for backend models
@@ -210,6 +407,8 @@ type Classifier struct {
 	MCPCategoryModel `yaml:"mcp_category_model,omitempty"`
 	// PII detection model
 	PIIModel `yaml:"pii_model"`
+	// Preference model configuration for local preference classification
+	PreferenceModel PreferenceModelConfig `yaml:"preference_model,omitempty"`
 }
 
 type BertModel struct {
@@ -223,6 +422,7 @@ type CategoryModel struct {
 	Threshold           float32 `yaml:"threshold"`
 	UseCPU              bool    `yaml:"use_cpu"`
 	UseModernBERT       bool    `yaml:"use_modernbert"`
+	UseMmBERT32K        bool    `yaml:"use_mmbert_32k"` // Use mmBERT-32K (YaRN, 32K context) instead of ModernBERT
 	CategoryMappingPath string  `yaml:"category_mapping_path"`
 	// FallbackCategory is returned when classification confidence is below threshold.
 	// Default is "other" if not specified.
@@ -233,6 +433,7 @@ type PIIModel struct {
 	ModelID        string  `yaml:"model_id"`
 	Threshold      float32 `yaml:"threshold"`
 	UseCPU         bool    `yaml:"use_cpu"`
+	UseMmBERT32K   bool    `yaml:"use_mmbert_32k"` // Use mmBERT-32K (YaRN, 32K context) for PII detection
 	PIIMappingPath string  `yaml:"pii_mapping_path"`
 }
 
@@ -241,6 +442,9 @@ type EmbeddingModels struct {
 	Qwen3ModelPath string `yaml:"qwen3_model_path"`
 	// Path to EmbeddingGemma-300M model directory
 	GemmaModelPath string `yaml:"gemma_model_path"`
+	// Path to mmBERT 2D Matryoshka embedding model directory
+	// Supports layer early exit (3/6/11/22 layers) and dimension reduction (64-768)
+	MmBertModelPath string `yaml:"mmbert_model_path"`
 	// Use CPU for inference (default: true, auto-detect GPU if available)
 	UseCPU bool `yaml:"use_cpu"`
 
@@ -250,58 +454,60 @@ type EmbeddingModels struct {
 }
 
 // HNSWConfig contains settings for optimizing the embedding classifier
-// by preloading candidate embeddings at startup and using HNSW for fast similarity search
+// Note: Despite the name, HNSW indexing is no longer used for embedding classification.
+// The classifier always uses brute-force search to ensure complete results for all candidates.
+// This struct is kept for backward compatibility and may be renamed in a future version.
 type HNSWConfig struct {
+	// ModelType specifies which embedding model to use (default: "qwen3")
+	// Options: "qwen3" (high quality, 32K context), "gemma" (fast, 8K context), or "mmbert" (multilingual, 2D Matryoshka)
+	// This model will be used for both preloading and runtime embedding generation
+	ModelType string `yaml:"model_type,omitempty"`
+
 	// PreloadEmbeddings enables precomputing candidate embeddings at startup (default: true)
 	// When enabled, candidate embeddings are computed once during initialization
 	// rather than on every request, significantly improving runtime performance
 	PreloadEmbeddings bool `yaml:"preload_embeddings"`
 
-	// UseHNSW enables HNSW index for O(log n) similarity search (default: true)
-	// Only applies when PreloadEmbeddings is true
-	UseHNSW bool `yaml:"use_hnsw"`
-
-	// HNSWM is the number of bi-directional links per node (default: 16)
-	// Higher values improve recall but increase memory usage
-	HNSWM int `yaml:"hnsw_m,omitempty"`
-
-	// HNSWEfConstruction is the size of dynamic candidate list during index construction (default: 200)
-	// Higher values improve index quality but increase build time
-	HNSWEfConstruction int `yaml:"hnsw_ef_construction,omitempty"`
-
-	// HNSWEfSearch is the size of dynamic candidate list during search (default: 50)
-	// Higher values improve search accuracy but increase latency
-	HNSWEfSearch int `yaml:"hnsw_ef_search,omitempty"`
-
-	// HNSWThreshold is the minimum number of candidates to use HNSW (default: 20)
-	// Below this threshold, brute-force search is used as it's faster for small sets
-	HNSWThreshold int `yaml:"hnsw_threshold,omitempty"`
-
 	// TargetDimension is the embedding dimension to use (default: 768)
-	// Supports Matryoshka dimensions: 768, 512, 256, 128
+	// Supports Matryoshka dimensions: 768, 512, 256, 128, 64
 	TargetDimension int `yaml:"target_dimension,omitempty"`
+
+	// TargetLayer is the layer for mmBERT early exit (default: 0 = full model)
+	// Only used when ModelType is "mmbert"
+	// Options: 3 (fastest, ~7x speedup), 6 (~3.6x), 11 (~2x), 22 (full model)
+	TargetLayer int `yaml:"target_layer,omitempty"`
+
+	// EnableSoftMatching enables soft matching mode (default: true)
+	// When enabled, if no rule meets its threshold, returns the rule with highest score
+	// (as long as it exceeds MinScoreThreshold)
+	// Use pointer to distinguish between "not set" (nil) and explicitly disabled (false)
+	EnableSoftMatching *bool `yaml:"enable_soft_matching,omitempty"`
+
+	// MinScoreThreshold is the minimum score required for soft matching (default: 0.5)
+	// Only used when EnableSoftMatching is true
+	// If the highest score is below this threshold, no rule will be matched
+	MinScoreThreshold float32 `yaml:"min_score_threshold,omitempty"`
 }
 
 // WithDefaults returns a copy of the config with default values applied
 func (c HNSWConfig) WithDefaults() HNSWConfig {
 	result := c
-	// PreloadEmbeddings defaults to true for better performance
-	// Note: bool zero value is false, so we need explicit check
-	// Users must explicitly set preload_embeddings: true in config
-	if result.HNSWM <= 0 {
-		result.HNSWM = 16
-	}
-	if result.HNSWEfConstruction <= 0 {
-		result.HNSWEfConstruction = 200
-	}
-	if result.HNSWEfSearch <= 0 {
-		result.HNSWEfSearch = 50
-	}
-	if result.HNSWThreshold <= 0 {
-		result.HNSWThreshold = 20
+	// ModelType defaults to "qwen3" for high quality embeddings
+	if result.ModelType == "" {
+		result.ModelType = "qwen3"
 	}
 	if result.TargetDimension <= 0 {
 		result.TargetDimension = 768
+	}
+	// EnableSoftMatching: nil means not set, use default true
+	// false means explicitly disabled (valid value)
+	if result.EnableSoftMatching == nil {
+		defaultEnabled := true
+		result.EnableSoftMatching = &defaultEnabled
+	}
+	// MinScoreThreshold defaults to 0.5 for soft matching
+	if result.MinScoreThreshold <= 0 {
+		result.MinScoreThreshold = 0.5
 	}
 	return result
 }
@@ -347,6 +553,128 @@ func (l *LooperConfig) GetTimeout() int {
 	return l.TimeoutSeconds
 }
 
+// RedisConfig defines the complete configuration structure for Redis cache backend.
+type RedisConfig struct {
+	Connection struct {
+		Host     string `json:"host" yaml:"host"`
+		Port     int    `json:"port" yaml:"port"`
+		Database int    `json:"database" yaml:"database"`
+		Password string `json:"password" yaml:"password"`
+		Timeout  int    `json:"timeout" yaml:"timeout"`
+		TLS      struct {
+			Enabled  bool   `json:"enabled" yaml:"enabled"`
+			CertFile string `json:"cert_file" yaml:"cert_file"`
+			KeyFile  string `json:"key_file" yaml:"key_file"`
+			CAFile   string `json:"ca_file" yaml:"ca_file"`
+		} `json:"tls" yaml:"tls"`
+	} `json:"connection" yaml:"connection"`
+	Index struct {
+		Name        string `json:"name" yaml:"name"`
+		Prefix      string `json:"prefix" yaml:"prefix"`
+		VectorField struct {
+			Name       string `json:"name" yaml:"name"`
+			Dimension  int    `json:"dimension" yaml:"dimension"`
+			MetricType string `json:"metric_type" yaml:"metric_type"` // L2, IP, COSINE
+		} `json:"vector_field" yaml:"vector_field"`
+		IndexType string `json:"index_type" yaml:"index_type"` // HNSW or FLAT
+		Params    struct {
+			M              int `json:"M" yaml:"M"`
+			EfConstruction int `json:"efConstruction" yaml:"efConstruction"`
+		} `json:"params" yaml:"params"`
+	} `json:"index" yaml:"index"`
+	Search struct {
+		TopK int `json:"topk" yaml:"topk"`
+	} `json:"search" yaml:"search"`
+	Development struct {
+		DropIndexOnStartup bool `json:"drop_index_on_startup" yaml:"drop_index_on_startup"`
+		AutoCreateIndex    bool `json:"auto_create_index" yaml:"auto_create_index"`
+		VerboseErrors      bool `json:"verbose_errors" yaml:"verbose_errors"`
+	} `json:"development" yaml:"development"`
+	Logging struct {
+		Level          string `json:"level" yaml:"level"`
+		EnableQueryLog bool   `json:"enable_query_log" yaml:"enable_query_log"`
+		EnableMetrics  bool   `json:"enable_metrics" yaml:"enable_metrics"`
+	} `json:"logging" yaml:"logging"`
+}
+
+// MilvusConfig defines the complete configuration structure for Milvus cache backend.
+// Fields use both json/yaml tags because sigs.k8s.io/yaml converts YAML→JSON before decoding,
+// so json tags ensure snake_case keys map correctly without switching parsers.
+type MilvusConfig struct {
+	Connection struct {
+		Host     string `json:"host" yaml:"host"`
+		Port     int    `json:"port" yaml:"port"`
+		Database string `json:"database" yaml:"database"`
+		Timeout  int    `json:"timeout" yaml:"timeout"`
+		Auth     struct {
+			Enabled  bool   `json:"enabled" yaml:"enabled"`
+			Username string `json:"username" yaml:"username"`
+			Password string `json:"password" yaml:"password"`
+		} `json:"auth" yaml:"auth"`
+		TLS struct {
+			Enabled  bool   `json:"enabled" yaml:"enabled"`
+			CertFile string `json:"cert_file" yaml:"cert_file"`
+			KeyFile  string `json:"key_file" yaml:"key_file"`
+			CAFile   string `json:"ca_file" yaml:"ca_file"`
+		} `json:"tls" yaml:"tls"`
+	} `json:"connection" yaml:"connection"`
+	Collection struct {
+		Name        string `json:"name" yaml:"name"`
+		Description string `json:"description" yaml:"description"`
+		VectorField struct {
+			Name       string `json:"name" yaml:"name"`
+			Dimension  int    `json:"dimension" yaml:"dimension"`
+			MetricType string `json:"metric_type" yaml:"metric_type"`
+		} `json:"vector_field" yaml:"vector_field"`
+		Index struct {
+			Type   string `json:"type" yaml:"type"`
+			Params struct {
+				M              int `json:"M" yaml:"M"`
+				EfConstruction int `json:"efConstruction" yaml:"efConstruction"`
+			} `json:"params" yaml:"params"`
+		} `json:"index" yaml:"index"`
+	} `json:"collection" yaml:"collection"`
+	Search struct {
+		Params struct {
+			Ef int `json:"ef" yaml:"ef"`
+		} `json:"params" yaml:"params"`
+		TopK             int    `json:"topk" yaml:"topk"`
+		ConsistencyLevel string `json:"consistency_level" yaml:"consistency_level"`
+	} `json:"search" yaml:"search"`
+	Performance struct {
+		ConnectionPool struct {
+			MaxConnections     int `json:"max_connections" yaml:"max_connections"`
+			MaxIdleConnections int `json:"max_idle_connections" yaml:"max_idle_connections"`
+			AcquireTimeout     int `json:"acquire_timeout" yaml:"acquire_timeout"`
+		} `json:"connection_pool" yaml:"connection_pool"`
+		Batch struct {
+			InsertBatchSize int `json:"insert_batch_size" yaml:"insert_batch_size"`
+			Timeout         int `json:"timeout" yaml:"timeout"`
+		} `json:"batch" yaml:"batch"`
+	} `json:"performance" yaml:"performance"`
+	DataManagement struct {
+		TTL struct {
+			Enabled         bool   `json:"enabled" yaml:"enabled"`
+			TimestampField  string `json:"timestamp_field" yaml:"timestamp_field"`
+			CleanupInterval int    `json:"cleanup_interval" yaml:"cleanup_interval"`
+		} `json:"ttl" yaml:"ttl"`
+		Compaction struct {
+			Enabled  bool `json:"enabled" yaml:"enabled"`
+			Interval int  `json:"interval" yaml:"interval"`
+		} `json:"compaction" yaml:"compaction"`
+	} `json:"data_management" yaml:"data_management"`
+	Logging struct {
+		Level          string `json:"level" yaml:"level"`
+		EnableQueryLog bool   `json:"enable_query_log" yaml:"enable_query_log"`
+		EnableMetrics  bool   `json:"enable_metrics" yaml:"enable_metrics"`
+	} `json:"logging" yaml:"logging"`
+	Development struct {
+		DropCollectionOnStartup bool `json:"drop_collection_on_startup" yaml:"drop_collection_on_startup"`
+		AutoCreateCollection    bool `json:"auto_create_collection" yaml:"auto_create_collection"`
+		VerboseErrors           bool `json:"verbose_errors" yaml:"verbose_errors"`
+	} `json:"development" yaml:"development"`
+}
+
 type SemanticCache struct {
 	// Type of cache backend to use
 	BackendType string `yaml:"backend_type,omitempty"`
@@ -367,7 +695,13 @@ type SemanticCache struct {
 	// Eviction policy for in-memory cache ("fifo", "lru", "lfu")
 	EvictionPolicy string `yaml:"eviction_policy,omitempty"`
 
-	// Path to backend-specific configuration file
+	// Redis configuration
+	Redis *RedisConfig `yaml:"redis,omitempty"`
+
+	// Milvus configuration
+	Milvus *MilvusConfig `yaml:"milvus,omitempty"`
+
+	// BackendConfigPath is a path to the backend-specific configuration file (Deprecated)
 	BackendConfigPath string `yaml:"backend_config_path,omitempty"`
 
 	// Embedding model to use for semantic similarity ("bert", "qwen3", "gemma")
@@ -386,7 +720,7 @@ type ResponseAPIConfig struct {
 	// Enable Response API endpoints
 	Enabled bool `yaml:"enabled"`
 
-	// Storage backend type: "memory", "milvus"
+	// Storage backend type: "memory", "milvus", "redis"
 	// Default: "memory"
 	StoreBackend string `yaml:"store_backend,omitempty"`
 
@@ -401,6 +735,9 @@ type ResponseAPIConfig struct {
 
 	// Milvus configuration (when store_backend is "milvus")
 	Milvus ResponseAPIMilvusConfig `yaml:"milvus,omitempty"`
+
+	// Redis configuration (when store_backend is "redis")
+	Redis ResponseAPIRedisConfig `yaml:"redis,omitempty"`
 }
 
 // ResponseAPIMilvusConfig configures Milvus storage for Response API.
@@ -413,6 +750,42 @@ type ResponseAPIMilvusConfig struct {
 
 	// Collection name for storing responses
 	Collection string `yaml:"collection,omitempty"`
+}
+
+// ResponseAPIRedisConfig configures Redis storage for Response API.
+// Supports both inline configuration and external config file.
+type ResponseAPIRedisConfig struct {
+	// Basic connection (inline)
+	Address  string `yaml:"address,omitempty" json:"address,omitempty"`
+	Password string `yaml:"password,omitempty" json:"password,omitempty"`
+	DB       int    `yaml:"db" json:"db"`
+
+	// Key management
+	// Default: "sr:" (base prefix for keys like sr:response:xxx, sr:conversation:xxx)
+	KeyPrefix string `yaml:"key_prefix,omitempty" json:"key_prefix,omitempty"`
+
+	// Cluster support
+	ClusterMode      bool     `yaml:"cluster_mode,omitempty" json:"cluster_mode,omitempty"`
+	ClusterAddresses []string `yaml:"cluster_addresses,omitempty" json:"cluster_addresses,omitempty"`
+
+	// Connection pooling
+	PoolSize     int `yaml:"pool_size,omitempty" json:"pool_size,omitempty"`
+	MinIdleConns int `yaml:"min_idle_conns,omitempty" json:"min_idle_conns,omitempty"`
+	MaxRetries   int `yaml:"max_retries,omitempty" json:"max_retries,omitempty"`
+
+	// Timeouts (seconds)
+	DialTimeout  int `yaml:"dial_timeout,omitempty" json:"dial_timeout,omitempty"`
+	ReadTimeout  int `yaml:"read_timeout,omitempty" json:"read_timeout,omitempty"`
+	WriteTimeout int `yaml:"write_timeout,omitempty" json:"write_timeout,omitempty"`
+
+	// TLS
+	TLSEnabled  bool   `yaml:"tls_enabled,omitempty" json:"tls_enabled,omitempty"`
+	TLSCertPath string `yaml:"tls_cert_path,omitempty" json:"tls_cert_path,omitempty"`
+	TLSKeyPath  string `yaml:"tls_key_path,omitempty" json:"tls_key_path,omitempty"`
+	TLSCAPath   string `yaml:"tls_ca_path,omitempty" json:"tls_ca_path,omitempty"`
+
+	// Optional external config file
+	ConfigPath string `yaml:"config_path,omitempty" json:"config_path,omitempty"`
 }
 
 // KeywordRule defines a rule for keyword-based classification.
@@ -593,12 +966,16 @@ type PromptGuardConfig struct {
 	// Ignored when use_vllm is true
 	UseModernBERT bool `yaml:"use_modernbert"`
 
+	// Use mmBERT-32K for jailbreak detection (32K context, YaRN RoPE, multilingual)
+	// Takes precedence over UseModernBERT when both are true
+	UseMmBERT32K bool `yaml:"use_mmbert_32k"`
+
 	// Path to the jailbreak type mapping file
 	JailbreakMappingPath string `yaml:"jailbreak_mapping_path"`
 
 	// Use vLLM REST API instead of Candle for guardrail/safety checks
 	// When true, vLLM configuration must be provided in external_models with model_role="guardrail"
-	// When false (default), uses Candle-based classification with ModelID, UseCPU, and UseModernBERT
+	// When false (default), uses Candle-based classification with ModelID, UseCPU, and UseModernBERT/UseMmBERT32K
 	UseVLLM bool `yaml:"use_vllm,omitempty"`
 }
 
@@ -621,8 +998,29 @@ type FeedbackDetectorConfig struct {
 	// Use ModernBERT for feedback detection (Candle ModernBERT flag)
 	UseModernBERT bool `yaml:"use_modernbert"`
 
+	// Use mmBERT-32K for feedback detection (32K context, YaRN RoPE, multilingual)
+	// Takes precedence over UseModernBERT when both are true
+	UseMmBERT32K bool `yaml:"use_mmbert_32k"`
+
 	// Path to the feedback type mapping file
 	FeedbackMappingPath string `yaml:"feedback_mapping_path"`
+}
+
+// PreferenceModelConfig represents configuration for local (Candle) preference classification
+// This enables running the preference classifier without an external vLLM endpoint.
+type PreferenceModelConfig struct {
+	// Model ID/path for the preference classification model (Candle model path)
+	ModelID string `yaml:"model_id"`
+
+	// Confidence threshold for accepting the predicted preference (0.0-1.0)
+	// If 0, no thresholding is applied.
+	Threshold float32 `yaml:"threshold,omitempty"`
+
+	// Use CPU for inference (Candle CPU flag)
+	UseCPU bool `yaml:"use_cpu"`
+
+	// Use Qwen3 preference classifier (zero-shot / fine-tuned)
+	UseQwen3 bool `yaml:"use_qwen3"`
 }
 
 // ExternalModelConfig represents configuration for external LLM-based models
@@ -745,6 +1143,9 @@ type FactCheckModelConfig struct {
 
 	// Use CPU for inference
 	UseCPU bool `yaml:"use_cpu"`
+
+	// Use mmBERT-32K for fact-check classification (32K context, YaRN RoPE, multilingual)
+	UseMmBERT32K bool `yaml:"use_mmbert_32k"`
 }
 
 // HallucinationModelConfig represents configuration for hallucination detection model
@@ -760,6 +1161,37 @@ type HallucinationModelConfig struct {
 
 	// Use CPU for inference
 	UseCPU bool `yaml:"use_cpu"`
+
+	// Minimum span length (in tokens) to consider for hallucination detection
+	// Helps reduce false positives from single-token mismatches
+	// Default: 1
+	MinSpanLength int `yaml:"min_span_length,omitempty"`
+
+	// MinSpanConfidence is the minimum average confidence (0.0–1.0)
+	// required for a span to be considered non-hallucinated.
+	// Spans with average confidence below this threshold are flagged
+	// as potential hallucinations.
+	// Default: 0.0 (disable span confidence filtering)
+	MinSpanConfidence float32 `yaml:"min_span_confidence,omitempty"`
+
+	// Context window size for span extraction (in tokens)
+	// Provides additional context around detected spans for better accuracy
+	// Default: 50
+	ContextWindowSize int `yaml:"context_window_size,omitempty"`
+
+	// EnableNLIFiltering enables NLI-based false positive filtering.
+	// When enabled, an NLI model verifies whether detected hallucination
+	// spans are actually unsupported by the surrounding context,
+	// reducing false positives.
+	// Default: false
+	EnableNLIFiltering bool `yaml:"enable_nli_filtering,omitempty"`
+
+	// NLIEntailmentThreshold is the confidence threshold (0.0-1.0)
+	// for NLI entailment when filtering hallucination spans.
+	// Spans with NLI entailment confidence above this threshold
+	// are considered supported by context and not hallucinations.
+	// Default: 0.75
+	NLIEntailmentThreshold float32 `yaml:"nli_entailment_threshold,omitempty"`
 }
 
 // NLIModelConfig represents configuration for the NLI (Natural Language Inference) model
@@ -810,6 +1242,17 @@ type VLLMEndpoint struct {
 
 	// Load balancing weight for this endpoint
 	Weight int `yaml:"weight,omitempty"`
+
+	// Type of endpoint API: "vllm" (default), "openai", "ollama", "huggingface", "openrouter"
+	// This determines how requests are formatted and which API format to use
+	// +optional
+	// +kubebuilder:default=vllm
+	Type string `yaml:"type,omitempty"`
+
+	// API key for authenticated endpoints (HuggingFace, OpenRouter, etc.)
+	// Can also be set via environment variables: HF_API_KEY, OPENROUTER_API_KEY
+	// +optional
+	APIKey string `yaml:"api_key,omitempty"`
 }
 
 // ModelPricing represents configuration for model-specific parameters
@@ -845,6 +1288,33 @@ type ModelParams struct {
 	// Used by confidence algorithm to determine model order.
 	// Larger parameter count typically means more capable but slower/costlier model.
 	ParamSize string `yaml:"param_size,omitempty"`
+
+	// APIFormat specifies the API format for this model: "openai" (default) or "anthropic"
+	// When set to "anthropic", the router will translate OpenAI-format requests to Anthropic
+	// Messages API format and convert responses back to OpenAI format
+	APIFormat string `yaml:"api_format,omitempty"`
+
+	// Description provides a natural language description of the model's capabilities
+	// Used by RouterDC to compute model embeddings for query-model matching
+	// Example: "Fast, efficient model for simple queries and basic code generation"
+	Description string `yaml:"description,omitempty"`
+
+	// Capabilities is a list of structured capability tags for the model
+	// Used by RouterDC and hybrid selection methods for capability matching
+	// Example: ["chat", "code", "reasoning", "math", "creative"]
+	Capabilities []string `yaml:"capabilities,omitempty"`
+
+	// QualityScore is the estimated quality/capability score for the model (0.0-1.0)
+	// Used by AutoMix and hybrid selection for quality-cost tradeoff calculations
+	// Default: 0.8 if not specified
+	// Example: 0.95 for a high-quality model, 0.6 for a fast but less capable model
+	QualityScore float64 `yaml:"quality_score,omitempty"`
+
+	// ExternalModelIDs maps endpoint types to their model identifiers
+	// This allows mapping the internal model name to different external model IDs
+	// Example: {"huggingface": "meta-llama/Llama-3.1-8B-Instruct", "ollama": "llama3.1:8b"}
+	// +optional
+	ExternalModelIDs map[string]string `yaml:"external_model_ids,omitempty"`
 }
 
 // LoRAAdapter represents a LoRA adapter configuration for a model
@@ -922,7 +1392,12 @@ type Decision struct {
 	// Rules defines the combination of keyword/embedding/domain rules using AND/OR logic
 	Rules RuleCombination `yaml:"rules"`
 
-	// ModelRefs contains model references for this decision (currently only supports one model)
+	// ModelSelectionAlgorithm configures how to select from multiple models in ModelRefs
+	// If not specified, defaults to selecting the first model
+	ModelSelectionAlgorithm *ModelSelectionConfig `yaml:"modelSelectionAlgorithm,omitempty"`
+
+	// ModelRefs contains model references for this decision
+	// When multiple models are specified, ModelSelectionAlgorithm determines which to use
 	ModelRefs []ModelRef `yaml:"modelRefs,omitempty"`
 
 	// Algorithm defines the multi-model execution strategy when multiple ModelRefs are configured.
@@ -935,14 +1410,35 @@ type Decision struct {
 
 // AlgorithmConfig defines how multiple models should be executed and aggregated
 type AlgorithmConfig struct {
-	// Type specifies the algorithm type: "confidence", "ratings"
+	// Type specifies the algorithm type:
+	// Looper algorithms (multi-model execution):
 	// - "confidence": Try smaller models first, escalate to larger models if confidence is low
 	// - "ratings": Execute all models concurrently and return multiple choices for comparison
+	// - "remom": Multi-round parallel reasoning with intelligent synthesis (Reasoning for Mixture of Models)
+	// Selection algorithms (single model selection from candidates):
+	// - "static": Use static scores from configuration (default)
+	// - "elo": Use Elo rating system with Bradley-Terry model
+	// - "router_dc": Use dual-contrastive learning for query-model matching
+	// - "automix": Use POMDP-based cost-quality optimization
+	// - "hybrid": Combine multiple selection methods with configurable weights
 	Type string `yaml:"type"`
 
-	// Algorithm-specific configurations (only one should be set based on Type)
+	// Looper algorithm configurations (for multi-model execution)
 	Confidence *ConfidenceAlgorithmConfig `yaml:"confidence,omitempty"`
 	Ratings    *RatingsAlgorithmConfig    `yaml:"ratings,omitempty"`
+	ReMoM      *ReMoMAlgorithmConfig      `yaml:"remom,omitempty"`
+
+	// Selection algorithm configurations (for single model selection)
+	// These align with the global ModelSelectionConfig but can be overridden per-decision
+	Elo      *EloSelectionConfig      `yaml:"elo,omitempty"`
+	RouterDC *RouterDCSelectionConfig `yaml:"router_dc,omitempty"`
+	AutoMix  *AutoMixSelectionConfig  `yaml:"automix,omitempty"`
+	Hybrid   *HybridSelectionConfig   `yaml:"hybrid,omitempty"`
+
+	// OnError defines behavior when algorithm fails: "skip" or "fail"
+	// - "skip": Skip and use fallback (default)
+	// - "fail": Return error immediately
+	OnError string `yaml:"on_error,omitempty"`
 }
 
 // ConfidenceAlgorithmConfig configures the confidence algorithm
@@ -952,6 +1448,7 @@ type ConfidenceAlgorithmConfig struct {
 	// - "avg_logprob": Use average logprob across all tokens (default)
 	// - "margin": Use average margin between top-1 and top-2 logprobs (more accurate)
 	// - "hybrid": Use weighted combination of both methods
+	// - "self_verify": AutoMix self-verification - model evaluates its own answer (arXiv:2310.12963)
 	ConfidenceMethod string `yaml:"confidence_method,omitempty"`
 
 	// Threshold is the confidence threshold for escalation
@@ -973,6 +1470,17 @@ type ConfidenceAlgorithmConfig struct {
 	// - "skip": Skip the failed model and try the next one (default)
 	// - "fail": Return error immediately
 	OnError string `yaml:"on_error,omitempty"`
+
+	// EscalationOrder determines how models are ordered for cascaded execution
+	// - "size": Order by param_size (smallest first) - default behavior
+	// - "cost": Order by pricing (cheapest first) - AutoMix-style cost optimization
+	// - "automix": Use POMDP-optimized ordering based on cost-quality tradeoff
+	EscalationOrder string `yaml:"escalation_order,omitempty"`
+
+	// CostQualityTradeoff controls the balance when escalation_order is "automix"
+	// 0.0 = pure quality (ignore cost), 1.0 = pure cost (ignore quality)
+	// Default: 0.3 (favor quality but consider cost)
+	CostQualityTradeoff float64 `yaml:"cost_quality_tradeoff,omitempty"`
 }
 
 // HybridWeightsConfig configures weights for hybrid confidence method
@@ -992,6 +1500,102 @@ type RatingsAlgorithmConfig struct {
 	// - "skip": Skip the failed model and return remaining results (default)
 	// - "fail": Return error if any model fails
 	OnError string `yaml:"on_error,omitempty"`
+}
+
+// ReMoMAlgorithmConfig configures the ReMoM (Reasoning for Mixture of Models) algorithm
+// This algorithm performs multi-round parallel reasoning with intelligent synthesis
+// Inspired by PaCoRe (arXiv:2601.05593) but extended to support mixture of models
+type ReMoMAlgorithmConfig struct {
+	// BreadthSchedule defines the number of parallel calls per round
+	// The final round (K=1) is automatically appended
+	// Examples:
+	//   [4]      -> Low intensity: 2 rounds (4 → 1)
+	//   [16]     -> Medium intensity: 2 rounds (16 → 1)
+	//   [32, 4]  -> High intensity: 3 rounds (32 → 4 → 1)
+	BreadthSchedule []int `yaml:"breadth_schedule"`
+
+	// ModelDistribution specifies how to distribute calls among multiple models
+	// - "weighted": Distribute proportionally based on model weights (default)
+	// - "equal": Distribute evenly among all models
+	// - "first_only": Use only the first model (PaCoRe-compatible mode)
+	ModelDistribution string `yaml:"model_distribution,omitempty"`
+
+	// Temperature for generation (default: 1.0)
+	Temperature float64 `yaml:"temperature,omitempty"`
+
+	// IncludeReasoning determines whether to include reasoning content in synthesis
+	// When true, extracts vLLM reasoning fields and includes them in synthesis prompts
+	// Default: false
+	IncludeReasoning bool `yaml:"include_reasoning,omitempty"`
+
+	// CompactionStrategy defines how to compact responses between rounds
+	// - "full": Use complete responses (default)
+	// - "last_n_tokens": Keep only the last N tokens
+	CompactionStrategy string `yaml:"compaction_strategy,omitempty"`
+
+	// CompactionTokens specifies how many tokens to keep when using "last_n_tokens" strategy
+	// Default: 1000
+	CompactionTokens int `yaml:"compaction_tokens,omitempty"`
+
+	// SynthesisTemplate is a custom Go text/template for building synthesis prompts
+	// Available variables: .OriginalContent, .ReferenceResponses
+	// If empty, uses default template
+	SynthesisTemplate string `yaml:"synthesis_template,omitempty"`
+
+	// MaxConcurrent limits the number of concurrent model calls per round
+	// Default: no limit (all calls in a round execute concurrently)
+	MaxConcurrent int `yaml:"max_concurrent,omitempty"`
+
+	// OnError defines behavior when a model call fails: "skip" or "fail"
+	// - "skip": Skip the failed call and continue with remaining responses (default)
+	// - "fail": Return error immediately
+	OnError string `yaml:"on_error,omitempty"`
+
+	// ShuffleSeed for reproducible shuffling of responses
+	// Default: 42
+	ShuffleSeed int `yaml:"shuffle_seed,omitempty"`
+
+	// IncludeIntermediateResponses determines whether to include intermediate responses
+	// in the response body for visualization in the dashboard
+	// Default: true
+	IncludeIntermediateResponses bool `yaml:"include_intermediate_responses,omitempty"`
+
+	// MaxResponsesPerRound limits how many responses to save per round
+	// Useful to avoid large response bodies
+	// Default: no limit (save all responses)
+	MaxResponsesPerRound int `yaml:"max_responses_per_round,omitempty"`
+}
+
+// MLModelSelectionConfig configures the ML-based model selection algorithm
+// Supported types: knn, kmeans, svm
+type MLModelSelectionConfig struct {
+	// Type specifies the algorithm: "knn", "kmeans", "svm"
+	Type string `yaml:"type"`
+
+	// ModelsPath is the path to pre-trained model files (e.g., "trained_models/")
+	// If specified, loads pre-trained models instead of creating empty selectors
+	// The algorithm will look for {ModelsPath}/{type}_model.json
+	ModelsPath string `yaml:"models_path,omitempty"`
+
+	// K is the number of neighbors for KNN algorithm (default: 3)
+	K int `yaml:"k,omitempty"`
+
+	// NumClusters is the number of clusters for KMeans algorithm (default: equals number of models)
+	NumClusters int `yaml:"num_clusters,omitempty"`
+
+	// Kernel specifies the SVM kernel type: "linear", "rbf", "poly" (default: "rbf")
+	Kernel string `yaml:"kernel,omitempty"`
+
+	// Gamma is the RBF kernel parameter for SVM (default: 1.0)
+	Gamma float64 `yaml:"gamma,omitempty"`
+
+	// EfficiencyWeight controls the performance-efficiency tradeoff for KMeans (default: 0.3)
+	// 0 = pure performance (quality), 1 = pure efficiency (latency)
+	// Use pointer to distinguish "not set" (nil, uses default 0.3) from "explicitly 0"
+	EfficiencyWeight *float64 `yaml:"efficiency_weight,omitempty"`
+
+	// FeatureWeights allows custom weighting of features for selection
+	FeatureWeights map[string]float64 `yaml:"feature_weights,omitempty"`
 }
 
 // ModelRef represents a reference to a model (without score field)
@@ -1027,14 +1631,16 @@ type SemanticCachePluginConfig struct {
 
 // JailbreakPluginConfig represents configuration for jailbreak plugin
 type JailbreakPluginConfig struct {
-	Enabled   bool     `json:"enabled" yaml:"enabled"`
-	Threshold *float32 `json:"threshold,omitempty" yaml:"threshold,omitempty"`
+	Enabled        bool     `json:"enabled" yaml:"enabled"`
+	Threshold      *float32 `json:"threshold,omitempty" yaml:"threshold,omitempty"`
+	IncludeHistory bool     `json:"include_history,omitempty" yaml:"include_history,omitempty"` // Whether to include conversation history in detection (default: false)
 }
 
 // PIIPluginConfig represents configuration for pii plugin
 type PIIPluginConfig struct {
-	Enabled   bool     `json:"enabled" yaml:"enabled"`
-	Threshold *float32 `json:"threshold,omitempty" yaml:"threshold,omitempty"`
+	Enabled        bool     `json:"enabled" yaml:"enabled"`
+	Threshold      *float32 `json:"threshold,omitempty" yaml:"threshold,omitempty"`
+	IncludeHistory bool     `json:"include_history,omitempty" yaml:"include_history,omitempty"` // Whether to include conversation history in detection (default: false)
 
 	// PII Policy configuration
 	// When Enabled is true, all PII types are blocked by default unless listed in PIITypesAllowed
@@ -1093,14 +1699,13 @@ type HallucinationPluginConfig struct {
 	IncludeHallucinationDetails bool `json:"include_hallucination_details,omitempty" yaml:"include_hallucination_details,omitempty"`
 }
 
-// RouterReplayPluginConfig configures the router_replay plugin that captures
-// routing decisions and payload snippets for later debugging and replay.
-
+// RouterReplayPluginConfig represents configuration for router_replay plugin
+// This is the per-decision plugin configuration (overrides global router_replay config)
 type RouterReplayPluginConfig struct {
 	Enabled bool `json:"enabled" yaml:"enabled"`
 
 	// MaxRecords controls the maximum number of replay records kept in memory.
-	// Defaults to 200 when omitted or set to a non-positive value.
+	// Only applies when StoreBackend is "memory". Defaults to 200.
 	MaxRecords int `json:"max_records,omitempty" yaml:"max_records,omitempty"`
 
 	// CaptureRequestBody controls whether the original request body should be stored.
@@ -1114,6 +1719,69 @@ type RouterReplayPluginConfig struct {
 	// MaxBodyBytes caps how many bytes of request/response body are recorded.
 	// Defaults to 4096 bytes.
 	MaxBodyBytes int `json:"max_body_bytes,omitempty" yaml:"max_body_bytes,omitempty"`
+}
+
+// RouterReplayConfig configures the router replay system at the system level.
+// This provides storage backend configuration and system-level settings.
+// Per-decision settings (max_records, capture settings) are configured via router_replay plugin.
+type RouterReplayConfig struct {
+	// StoreBackend specifies the storage backend to use.
+	// Options: "memory", "redis", "postgres", "milvus". Defaults to "memory".
+	StoreBackend string `json:"store_backend,omitempty" yaml:"store_backend,omitempty"`
+
+	// TTLSeconds specifies how long records should be kept (in seconds).
+	// Only applies to persistent backends (redis, postgres, milvus).
+	// 0 means no expiration. Example: 2592000 for 30 days.
+	TTLSeconds int `json:"ttl_seconds,omitempty" yaml:"ttl_seconds,omitempty"`
+
+	// AsyncWrites enables asynchronous writes to the storage backend.
+	// Improves performance but may result in data loss if the process crashes.
+	AsyncWrites bool `json:"async_writes,omitempty" yaml:"async_writes,omitempty"`
+
+	// Redis configuration (required if StoreBackend is "redis")
+	Redis *RouterReplayRedisConfig `json:"redis,omitempty" yaml:"redis,omitempty"`
+
+	// Postgres configuration (required if StoreBackend is "postgres")
+	Postgres *RouterReplayPostgresConfig `json:"postgres,omitempty" yaml:"postgres,omitempty"`
+
+	// Milvus configuration (required if StoreBackend is "milvus")
+	Milvus *RouterReplayMilvusConfig `json:"milvus,omitempty" yaml:"milvus,omitempty"`
+}
+
+// RouterReplayRedisConfig holds Redis-specific configuration for router replay.
+type RouterReplayRedisConfig struct {
+	Address       string `json:"address" yaml:"address"`
+	DB            int    `json:"db,omitempty" yaml:"db,omitempty"`
+	Password      string `json:"password,omitempty" yaml:"password,omitempty"`
+	UseTLS        bool   `json:"use_tls,omitempty" yaml:"use_tls,omitempty"`
+	TLSSkipVerify bool   `json:"tls_skip_verify,omitempty" yaml:"tls_skip_verify,omitempty"`
+	MaxRetries    int    `json:"max_retries,omitempty" yaml:"max_retries,omitempty"`
+	PoolSize      int    `json:"pool_size,omitempty" yaml:"pool_size,omitempty"`
+	KeyPrefix     string `json:"key_prefix,omitempty" yaml:"key_prefix,omitempty"`
+}
+
+// RouterReplayPostgresConfig holds PostgreSQL-specific configuration for router replay.
+type RouterReplayPostgresConfig struct {
+	Host            string `json:"host" yaml:"host"`
+	Port            int    `json:"port,omitempty" yaml:"port,omitempty"`
+	Database        string `json:"database" yaml:"database"`
+	User            string `json:"user" yaml:"user"`
+	Password        string `json:"password,omitempty" yaml:"password,omitempty"`
+	SSLMode         string `json:"ssl_mode,omitempty" yaml:"ssl_mode,omitempty"`
+	MaxOpenConns    int    `json:"max_open_conns,omitempty" yaml:"max_open_conns,omitempty"`
+	MaxIdleConns    int    `json:"max_idle_conns,omitempty" yaml:"max_idle_conns,omitempty"`
+	ConnMaxLifetime int    `json:"conn_max_lifetime,omitempty" yaml:"conn_max_lifetime,omitempty"`
+	TableName       string `json:"table_name,omitempty" yaml:"table_name,omitempty"`
+}
+
+// RouterReplayMilvusConfig holds Milvus-specific configuration for router replay.
+type RouterReplayMilvusConfig struct {
+	Address          string `json:"address" yaml:"address"`
+	Username         string `json:"username,omitempty" yaml:"username,omitempty"`
+	Password         string `json:"password,omitempty" yaml:"password,omitempty"`
+	CollectionName   string `json:"collection_name,omitempty" yaml:"collection_name,omitempty"`
+	ConsistencyLevel string `json:"consistency_level,omitempty" yaml:"consistency_level,omitempty"`
+	ShardNum         int    `json:"shard_num,omitempty" yaml:"shard_num,omitempty"`
 }
 
 // Helper methods for Decision to access plugin configurations
@@ -1375,6 +2043,89 @@ type LanguageRule struct {
 
 	// Description provides human-readable explanation of the language
 	Description string `yaml:"description,omitempty"`
+}
+
+// LatencyRule defines a rule for latency-based signal classification
+// The latency classifier evaluates if available models meet TPOT (Time Per Output Token) requirements
+type LatencyRule struct {
+	// Name is the latency rule name that can be referenced in decision rules
+	Name string `yaml:"name"`
+
+	// TPOTPercentile is the percentile bucket to use for TPOT (Time Per Output Token) evaluation (1-100)
+	// Models with current TPOT <= the calculated TPOT percentile threshold will match this rule
+	// Example: 10 means 10th percentile (top 10% fastest TPOT)
+	// Example: 50 means median (top 50% fastest TPOT)
+	// Works with any number of observations (1+), adapts to model's actual performance
+	TPOTPercentile int `yaml:"tpot_percentile,omitempty"`
+
+	// TTFTPercentile is the percentile bucket to use for TTFT (Time To First Token) evaluation (1-100)
+	// Models with current TTFT <= the calculated TTFT percentile threshold will match this rule
+	// Example: 10 means 10th percentile (top 10% fastest TTFT)
+	// Example: 50 means median (top 50% fastest TTFT)
+	// Works with any number of observations (1+), adapts to model's actual performance
+	// At least one of TPOTPercentile or TTFTPercentile must be set
+	TTFTPercentile int `yaml:"ttft_percentile,omitempty"`
+
+	// Description provides human-readable explanation of the latency requirement
+	Description string `yaml:"description,omitempty"`
+}
+
+// TokenCount represents a token count value with optional K/M suffixes
+type TokenCount string
+
+// Value parses the token count string into an integer
+func (t TokenCount) Value() (int, error) {
+	s := string(t)
+	if s == "" {
+		return 0, nil
+	}
+	s = strings.ToUpper(strings.TrimSpace(s))
+
+	multiplier := 1.0
+	if strings.HasSuffix(s, "K") {
+		multiplier = 1000.0
+		s = strings.TrimSuffix(s, "K")
+	} else if strings.HasSuffix(s, "M") {
+		multiplier = 1000000.0
+		s = strings.TrimSuffix(s, "M")
+	}
+
+	val, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid token count format: %s", t)
+	}
+
+	return int(val * multiplier), nil
+}
+
+// ContextRule defines a rule for context-based (token count) classification
+type ContextRule struct {
+	Name        string     `yaml:"name"`
+	MinTokens   TokenCount `yaml:"min_tokens"`
+	MaxTokens   TokenCount `yaml:"max_tokens"`
+	Description string     `yaml:"description,omitempty"`
+}
+
+// ComplexityCandidates defines hard and easy candidates for complexity classification
+type ComplexityCandidates struct {
+	Candidates []string `yaml:"candidates"`
+}
+
+// ComplexityRule defines a rule for complexity-based classification using embedding similarity
+// The classifier computes max similarity to hard and easy candidates, then:
+// - If (max_hard_sim - max_easy_sim) > threshold: outputs "rulename:hard"
+// - If (max_hard_sim - max_easy_sim) < -threshold: outputs "rulename:easy"
+// - Otherwise: outputs "rulename:medium"
+//
+// The Composer field allows filtering based on other signals (e.g., only apply code_complexity when domain is "computer_science")
+// This is evaluated after all signals are computed in parallel, enabling signal dependencies.
+type ComplexityRule struct {
+	Name        string               `yaml:"name"`
+	Threshold   float32              `yaml:"threshold"`
+	Hard        ComplexityCandidates `yaml:"hard"`
+	Easy        ComplexityCandidates `yaml:"easy"`
+	Description string               `yaml:"description,omitempty"`
+	Composer    *RuleCombination     `yaml:"composer,omitempty"` // Optional: filter based on other signals
 }
 
 // ModelReasoningControl represents reasoning mode control on model level

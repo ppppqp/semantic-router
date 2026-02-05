@@ -2,12 +2,16 @@ package extproc
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
 	ext_proc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	"github.com/openai/openai-go"
 
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/anthropic"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/classification"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/metrics"
 )
@@ -19,10 +23,15 @@ func (r *OpenAIRouter) handleResponseBody(v *ext_proc.ProcessingRequest_Response
 	// Decrement active request count for queue depth estimation
 	defer metrics.DecrementModelActiveRequests(ctx.RequestModel)
 
-	// If this is a looper internal request, skip all processing and just continue
+	// If this is a looper internal request, capture response body for router replay and continue
 	// The response will be handled by the looper client directly
 	if ctx.LooperRequest {
-		logging.Debugf("[Looper] Skipping response body processing for internal request")
+		logging.Debugf("[Looper] Capturing response body for router replay")
+
+		// Capture response body for router replay if enabled
+		responseBody := v.ResponseBody.Body
+		r.attachRouterReplayResponse(ctx, responseBody, true)
+
 		return &ext_proc.ProcessingResponse{
 			Response: &ext_proc.ProcessingResponse_ResponseBody{
 				ResponseBody: &ext_proc.BodyResponse{
@@ -37,6 +46,21 @@ func (r *OpenAIRouter) handleResponseBody(v *ext_proc.ProcessingRequest_Response
 	// Process the response for caching
 	responseBody := v.ResponseBody.Body
 
+	// Transform Anthropic API response to OpenAI format if this is an Anthropic-routed request
+	anthropicTransformed := false
+	if ctx.APIFormat == config.APIFormatAnthropic {
+		transformedBody, err := anthropic.ToOpenAIResponseBody(responseBody, ctx.RequestModel)
+		if err != nil {
+			logging.Errorf("Failed to transform Anthropic response to OpenAI format: %v", err)
+			// Return error response to client
+			return r.createErrorResponse(502, fmt.Sprintf("Response transformation error: %v", err)), nil
+		}
+		logging.Infof("Transformed Anthropic response to OpenAI format, original size: %d, transformed size: %d",
+			len(responseBody), len(transformedBody))
+		responseBody = transformedBody
+		anthropicTransformed = true
+	}
+
 	// If this is a streaming response (e.g., SSE), record TTFT on the first body chunk
 	// and accumulate chunks for caching when stream completes.
 	if ctx.IsStreamingResponse {
@@ -46,7 +70,9 @@ func (r *OpenAIRouter) handleResponseBody(v *ext_proc.ProcessingRequest_Response
 				metrics.RecordModelTTFT(ctx.RequestModel, ttft)
 				ctx.TTFTSeconds = ttft
 				ctx.TTFTRecorded = true
-				logging.Infof("Recorded TTFT on first streamed body chunk: %.3fs", ttft)
+				// Update TTFT cache for latency signal evaluation
+				classification.UpdateTTFT(ctx.RequestModel, ttft)
+				logging.Debugf("Recorded TTFT on first streamed body chunk: model=%q, TTFT=%.4fs", ctx.RequestModel, ttft)
 			}
 		}
 
@@ -65,6 +91,15 @@ func (r *OpenAIRouter) handleResponseBody(v *ext_proc.ProcessingRequest_Response
 		if strings.Contains(chunk, "data: [DONE]") {
 			ctx.StreamingComplete = true
 			logging.Infof("Streaming response completed, attempting to cache")
+
+			// Record completion latency for streaming responses
+			if ctx.RequestModel != "" && !ctx.StartTime.IsZero() {
+				completionLatency := time.Since(ctx.StartTime).Seconds()
+				metrics.RecordModelCompletionLatency(ctx.RequestModel, completionLatency)
+				logging.Infof("Recorded completion latency for streaming response: model=%s, latency=%.3fs",
+					ctx.RequestModel, completionLatency)
+			}
+
 			// Reconstruct and cache the complete response
 			if err := r.cacheStreamingResponse(ctx); err != nil {
 				logging.Errorf("Failed to cache streaming response: %v", err)
@@ -111,6 +146,12 @@ func (r *OpenAIRouter) handleResponseBody(v *ext_proc.ProcessingRequest_Response
 		if completionTokens > 0 {
 			timePerToken := completionLatency.Seconds() / float64(completionTokens)
 			metrics.RecordModelTPOT(ctx.RequestModel, timePerToken)
+			// Update latency classifier cache for real-time routing decisions
+			// Note: ctx.RequestModel should match the model name used in decision ModelRefs
+			// (either ModelRef.Model or ModelRef.LoRAName, depending on selection)
+			// UpdateTPOT will trim whitespace to ensure canonical matching
+			logging.Debugf("Updating TPOT cache for model: %q, TPOT: %.4f", ctx.RequestModel, timePerToken)
+			classification.UpdateTPOT(ctx.RequestModel, timePerToken)
 		}
 
 		// Record windowed model metrics for load balancing
@@ -190,7 +231,9 @@ func (r *OpenAIRouter) handleResponseBody(v *ext_proc.ProcessingRequest_Response
 	// Build response with possible body modification
 	var bodyMutation *ext_proc.BodyMutation
 	var headerMutation *ext_proc.HeaderMutation
-	if finalBody != nil && ctx.ResponseAPICtx != nil && ctx.ResponseAPICtx.IsResponseAPIRequest {
+
+	// Set body mutation if response was transformed (Anthropic or Response API)
+	if anthropicTransformed || (ctx.ResponseAPICtx != nil && ctx.ResponseAPICtx.IsResponseAPIRequest) {
 		bodyMutation = &ext_proc.BodyMutation{
 			Mutation: &ext_proc.BodyMutation_Body{
 				Body: finalBody,
@@ -258,6 +301,9 @@ func (r *OpenAIRouter) handleResponseBody(v *ext_proc.ProcessingRequest_Response
 			},
 		}
 	}
+
+	// Update router replay with hallucination detection results if enabled
+	r.updateRouterReplayHallucinationStatus(ctx)
 
 	// Capture replay response payload if enabled
 	r.attachRouterReplayResponse(ctx, finalBody, true)
@@ -369,6 +415,26 @@ func (r *OpenAIRouter) cacheStreamingResponse(ctx *RequestContext) error {
 		}
 		if totalTokens, ok := usageMap["total_tokens"].(float64); ok {
 			usage.TotalTokens = int64(totalTokens)
+		}
+	}
+
+	// Record token metrics for streaming responses
+	if ctx.RequestModel != "" && (usage.PromptTokens > 0 || usage.CompletionTokens > 0) {
+		metrics.RecordModelTokensDetailed(
+			ctx.RequestModel,
+			float64(usage.PromptTokens),
+			float64(usage.CompletionTokens),
+		)
+		logging.Infof("Recorded token metrics for streaming response: model=%s, prompt=%d, completion=%d",
+			ctx.RequestModel, usage.PromptTokens, usage.CompletionTokens)
+
+		// Record TPOT for streaming responses if completion tokens are available
+		if usage.CompletionTokens > 0 && !ctx.StartTime.IsZero() {
+			completionLatency := time.Since(ctx.StartTime).Seconds()
+			timePerToken := completionLatency / float64(usage.CompletionTokens)
+			metrics.RecordModelTPOT(ctx.RequestModel, timePerToken)
+			logging.Infof("Recorded TPOT for streaming response: model=%s, TPOT=%.4f", ctx.RequestModel, timePerToken)
+			classification.UpdateTPOT(ctx.RequestModel, timePerToken)
 		}
 	}
 

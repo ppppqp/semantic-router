@@ -13,6 +13,7 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/headers"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/tracing"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/routerreplay"
 )
 
 // EnhancedHallucinationSpan represents a hallucinated span with NLI explanation
@@ -64,6 +65,7 @@ type RequestContext struct {
 	VSRSelectedDecisionConfidence float64          // Confidence score from DecisionEngine evaluation
 	VSRReasoningMode              string           // "on" or "off" - whether reasoning mode was determined to be used
 	VSRSelectedModel              string           // The model selected by VSR
+	VSRSelectionMethod            string           // Model selection algorithm used (e.g., "elo", "static", "router_dc")
 	VSRCacheHit                   bool             // Whether this request hit the cache
 	VSRInjectedSystemPrompt       bool             // Whether a system prompt was injected into the request
 	VSRSelectedDecision           *config.Decision // The decision object selected by DecisionEngine (for plugins)
@@ -75,6 +77,11 @@ type RequestContext struct {
 	VSRMatchedFactCheck    []string // Matched fact-check signals
 	VSRMatchedUserFeedback []string // Matched user feedback signals
 	VSRMatchedPreference   []string // Matched preference signals
+	VSRMatchedLanguage     []string // Matched language signals
+	VSRMatchedLatency      []string // Matched latency signals
+	VSRMatchedContext      []string // Matched context rule names (e.g. "low_token_count")
+	VSRContextTokenCount   int      // Actual token count for the request
+	VSRMatchedComplexity   []string // Matched complexity rules with difficulty level (e.g. "code_complexity:hard")
 
 	// Endpoint tracking for windowed metrics
 	SelectedEndpoint string // The endpoint address selected for this request
@@ -90,6 +97,16 @@ type RequestContext struct {
 	EnhancedHallucinationInfo *EnhancedHallucinationInfo // Detailed NLI info (when use_nli enabled)
 	UnverifiedFactualResponse bool                       // True if fact-check needed but no tools to verify against
 
+	// Jailbreak Detection Results
+	JailbreakDetected   bool    // True if jailbreak was detected
+	JailbreakType       string  // Type of jailbreak detected
+	JailbreakConfidence float32 // Confidence score of jailbreak detection
+
+	// PII Detection Results
+	PIIDetected bool     // True if PII was detected
+	PIIEntities []string // PII entity types detected (e.g., ["EMAIL", "PHONE_NUMBER"])
+	PIIBlocked  bool     // True if request was blocked due to PII policy violation
+
 	// Tracing context
 	TraceContext context.Context // OpenTelemetry trace context for span propagation
 	UpstreamSpan trace.Span      // Span for tracking upstream vLLM request duration
@@ -98,12 +115,24 @@ type RequestContext struct {
 	ResponseAPICtx *ResponseAPIContext // Non-nil if this is a Response API request
 
 	// Router replay context
-	RouterReplayID     string                           // ID of the router replay session, if applicable
-	RouterReplayConfig *config.RouterReplayPluginConfig // Configuration for router replay, if applicable
+	RouterReplayID           string                           // ID of the router replay session, if applicable
+	RouterReplayPluginConfig *config.RouterReplayPluginConfig // Per-decision plugin configuration for router replay
+	RouterReplayRecorder     *routerreplay.Recorder           // The recorder instance for this decision
 
 	// Looper context
 	LooperRequest   bool // True if this request is from looper (internal request, skip plugins)
 	LooperIteration int  // The iteration number if this is a looper request
+
+	// External API routing context (for Envoy-routed external API requests)
+	// APIFormat indicates the target API format (e.g., "anthropic", "gemini")
+	// Empty string means standard OpenAI-compatible backend (no transformation needed)
+	APIFormat string
+
+	// RAG (Retrieval-Augmented Generation) tracking
+	RAGRetrievedContext string  // Retrieved context from RAG plugin
+	RAGBackend          string  // Backend used for retrieval ("milvus", "external_api", "mcp", "hybrid")
+	RAGSimilarityScore  float32 // Best similarity score from retrieval
+	RAGRetrievalLatency float64 // Retrieval latency in seconds
 }
 
 // handleRequestHeaders processes the request headers

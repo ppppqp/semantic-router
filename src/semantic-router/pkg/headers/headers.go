@@ -82,6 +82,27 @@ const (
 	// VSRMatchedPreference contains comma-separated list of matched preference signals.
 	// Example: "creative_writing,technical_analysis"
 	VSRMatchedPreference = "x-vsr-matched-preference"
+
+	// VSRMatchedLanguage contains comma-separated list of matched language signals.
+	// Example: "en,zh,es"
+	VSRMatchedLanguage = "x-vsr-matched-language"
+
+	// VSRMatchedLatency contains comma-separated list of matched latency signals.
+	// Example: "low_latency,medium_latency"
+	VSRMatchedLatency = "x-vsr-matched-latency"
+
+	// VSRMatchedContext contains comma-separated list of matched context rule names.
+	// Example: "low_token_count,high_token_count"
+	VSRMatchedContext = "x-vsr-matched-context"
+
+	// VSRContextTokenCount contains the actual token count for the request.
+	// Example: "1500"
+	//nolint:gosec
+	VSRContextTokenCount = "x-vsr-context-token-count"
+
+	// VSRMatchedComplexity contains comma-separated list of matched complexity rules with difficulty levels.
+	// Example: "code_complexity:hard,math_complexity:easy"
+	VSRMatchedComplexity = "x-vsr-matched-complexity"
 )
 
 // Security Headers
@@ -139,17 +160,21 @@ const (
 
 // Looper Request Headers
 // These headers are added to looper internal requests to identify them
-// and allow the extproc to skip plugin processing for looper requests.
+// and allow the extproc to lookup decision configuration and apply plugins.
 const (
 	// VSRLooperRequest indicates this is an internal looper request.
-	// When present, extproc should skip plugin processing (jailbreak, PII, hallucination, etc.)
-	// and pass the request directly to the backend.
+	// When present, extproc should lookup the decision and execute configured plugins.
 	// Value: "true"
 	VSRLooperRequest = "x-vsr-looper-request"
 
 	// VSRLooperIteration indicates the current iteration number in the looper loop.
 	// Value: "1", "2", "3", etc.
 	VSRLooperIteration = "x-vsr-looper-iteration"
+
+	// VSRLooperDecision indicates the decision name for looper internal requests.
+	// Used by extproc to lookup decision configuration and apply plugins.
+	// Value: decision name (e.g., "remom_low_effort")
+	VSRLooperDecision = "x-vsr-looper-decision"
 )
 
 // Looper Response Headers

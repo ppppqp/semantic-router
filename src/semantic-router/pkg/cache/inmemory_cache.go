@@ -61,6 +61,11 @@ type InMemoryCache struct {
 	hnswNeedsRebuild bool   // true while the HNSW graph is stale relative to entries
 	hnswEfSearch     int    // Search-time ef parameter
 	embeddingModel   string // "bert", "qwen3", or "gemma"
+
+	// Background cleanup
+	cleanupTicker *time.Ticker
+	stopCleanup   chan struct{}
+	closeOnce     sync.Once
 }
 
 // InMemoryCacheOptions contains configuration parameters for the in-memory cache
@@ -94,7 +99,7 @@ func NewInMemoryCache(options InMemoryCacheOptions) *InMemoryCache {
 		embeddingModel = "bert" // Default: BERT (fastest, lowest memory)
 	}
 
-	logging.Debugf("Semantic cache embedding model: %s", embeddingModel)
+	logging.Infof("[Semantic Cache] Initialized with embedding model: %s", embeddingModel)
 
 	cache := &InMemoryCache{
 		entries:             []CacheEntry{},
@@ -140,6 +145,19 @@ func NewInMemoryCache(options InMemoryCacheOptions) *InMemoryCache {
 		logging.Debugf("HNSW index initialized: M=%d, efConstruction=%d", M, efConstruction)
 	}
 
+	// Start background cleanup goroutine if TTL is enabled
+	if options.Enabled && options.TTLSeconds > 0 {
+		cache.stopCleanup = make(chan struct{})
+		// Run cleanup every TTL/2 seconds (e.g., every 30s for 60s TTL)
+		cleanupInterval := time.Duration(options.TTLSeconds/2) * time.Second
+		if cleanupInterval < 10*time.Second {
+			cleanupInterval = 10 * time.Second // Minimum 10 seconds
+		}
+		cache.cleanupTicker = time.NewTicker(cleanupInterval)
+		go cache.backgroundCleanup()
+		logging.Debugf("Background cleanup started: interval=%v", cleanupInterval)
+	}
+
 	return cache
 }
 
@@ -176,11 +194,19 @@ func (c *InMemoryCache) generateEmbedding(text string) ([]float32, error) {
 			return nil, err
 		}
 		return output.Embedding, nil
+	case "mmbert":
+		// Use GetEmbedding2DMatryoshka for mmBERT with 2D Matryoshka support
+		// Default to layer 6 (~3.6x speedup) and dimension 256 for good balance
+		output, err := candle_binding.GetEmbedding2DMatryoshka(text, modelName, 6, 256)
+		if err != nil {
+			return nil, err
+		}
+		return output.Embedding, nil
 	case "bert", "":
 		// Use traditional GetEmbedding for BERT (default)
 		return candle_binding.GetEmbedding(text, 0)
 	default:
-		return nil, fmt.Errorf("unsupported embedding model: %s (must be 'bert', 'qwen3', or 'gemma')", c.embeddingModel)
+		return nil, fmt.Errorf("unsupported embedding model: %s (must be 'bert', 'qwen3', 'gemma', or 'mmbert')", c.embeddingModel)
 	}
 }
 
@@ -474,7 +500,7 @@ func (c *InMemoryCache) FindSimilarWithThreshold(model string, query string, thr
 		// Search using HNSW index with configured ef parameter
 		candidateIndices := c.hnswIndex.searchKNN(queryEmbedding, 10, c.hnswEfSearch, c.entries)
 
-		// Filter candidates by model and expiration, then find best match
+		// Filter candidates by expiration, then find best match
 		for _, entryIndex := range candidateIndices {
 			if entryIndex < 0 || entryIndex >= len(c.entries) {
 				continue
@@ -484,11 +510,6 @@ func (c *InMemoryCache) FindSimilarWithThreshold(model string, query string, thr
 
 			// Skip incomplete entries
 			if entry.ResponseBody == nil {
-				continue
-			}
-
-			// Only consider entries for the same model
-			if entry.Model != model {
 				continue
 			}
 
@@ -517,11 +538,6 @@ func (c *InMemoryCache) FindSimilarWithThreshold(model string, query string, thr
 		for entryIndex, entry := range c.entries {
 			// Skip incomplete entries
 			if entry.ResponseBody == nil {
-				continue
-			}
-
-			// Only consider entries for the same model
-			if entry.Model != model {
 				continue
 			}
 
@@ -573,7 +589,6 @@ func (c *InMemoryCache) FindSimilarWithThreshold(model string, query string, thr
 		atomic.AddInt64(&c.missCount, 1)
 		logging.Debugf("InMemoryCache.FindSimilarWithThreshold: no entries found with responses")
 		metrics.RecordCacheOperation("memory", "find_similar", "miss", time.Since(start).Seconds())
-		metrics.RecordCacheMiss()
 		return nil, false, nil
 	}
 
@@ -594,7 +609,6 @@ func (c *InMemoryCache) FindSimilarWithThreshold(model string, query string, thr
 			"model":      model,
 		})
 		metrics.RecordCacheOperation("memory", "find_similar", "hit", time.Since(start).Seconds())
-		metrics.RecordCacheHit()
 		return bestEntry.ResponseBody, true, nil
 	}
 
@@ -609,22 +623,46 @@ func (c *InMemoryCache) FindSimilarWithThreshold(model string, query string, thr
 		"entries_checked": entriesChecked,
 	})
 	metrics.RecordCacheOperation("memory", "find_similar", "miss", time.Since(start).Seconds())
-	metrics.RecordCacheMiss()
 	return nil, false, nil
 }
 
 // Close releases all resources held by the cache
 func (c *InMemoryCache) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	// Use sync.Once to ensure cleanup happens only once
+	c.closeOnce.Do(func() {
+		// Stop background cleanup goroutine
+		if c.stopCleanup != nil {
+			close(c.stopCleanup)
+		}
+		if c.cleanupTicker != nil {
+			c.cleanupTicker.Stop()
+		}
 
-	// Clear all entries to free memory
-	c.entries = nil
+		c.mu.Lock()
+		defer c.mu.Unlock()
 
-	// Zero cache entries metrics
-	metrics.UpdateCacheEntries("memory", 0)
+		// Clear all entries to free memory
+		c.entries = nil
+
+		// Zero cache entries metrics
+		metrics.UpdateCacheEntries("memory", 0)
+	})
 
 	return nil
+}
+
+// backgroundCleanup runs periodic cleanup of expired entries
+func (c *InMemoryCache) backgroundCleanup() {
+	for {
+		select {
+		case <-c.cleanupTicker.C:
+			c.mu.Lock()
+			c.cleanupExpiredEntries()
+			c.mu.Unlock()
+		case <-c.stopCleanup:
+			return
+		}
+	}
 }
 
 // GetStats provides current cache performance metrics
@@ -724,6 +762,11 @@ func (c *InMemoryCache) cleanupExpiredEntriesInternal(deferRebuild bool) {
 	})
 	cleanupTime := time.Now()
 	c.lastCleanupTime = &cleanupTime
+
+	// Record cleanup operation metric
+	if expiredCount > 0 {
+		metrics.RecordCacheOperation("memory", "cleanup_expired", "success", time.Since(now).Seconds())
+	}
 
 	// Rebuild HNSW index if entries were removed and deferRebuild is false
 	if expiredCount > 0 && c.useHNSW && c.hnswIndex != nil {
@@ -871,6 +914,12 @@ func (c *InMemoryCache) evictOne() {
 		"request_id":  evictedRequestID,
 		"max_entries": c.maxEntries,
 	})
+
+	// Record eviction metric
+	metrics.RecordCacheOperation("memory", "evict", "success", 0)
+
+	// Update cache entries count after eviction
+	metrics.UpdateCacheEntries("memory", len(c.entries))
 }
 
 // ===== Optimized Eviction Policy Helpers =====

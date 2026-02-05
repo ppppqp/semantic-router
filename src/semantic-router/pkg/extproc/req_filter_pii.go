@@ -11,7 +11,6 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/metrics"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/tracing"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/utils/http"
-	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/utils/pii"
 )
 
 // performPIIDetection performs PII detection and policy check
@@ -27,6 +26,10 @@ func (r *OpenAIRouter) performPIIDetection(ctx *RequestContext, userContent stri
 	if len(detectedPII) == 0 {
 		return nil
 	}
+
+	// Track PII detection in context for replay recording
+	ctx.PIIDetected = true
+	ctx.PIIEntities = detectedPII
 
 	// Check PII policy
 	return r.checkPIIPolicy(ctx, detectedPII, decisionName)
@@ -58,30 +61,53 @@ func (r *OpenAIRouter) isPIIDetectionEnabled(decisionName string) bool {
 }
 
 // detectPIIWithTracing performs PII detection with tracing and logging
+// By default, only checks the current user message. Set include_history: true in plugin config to include conversation history.
 func (r *OpenAIRouter) detectPIIWithTracing(ctx *RequestContext, userContent string, nonUserMessages []string, categoryName string) []string {
-	allContent := pii.ExtractAllContent(userContent, nonUserMessages)
+	// Get decision-specific include_history setting
+	includeHistory := false
+	if categoryName != "" && r.Config != nil {
+		includeHistory = r.Config.GetPIIIncludeHistoryForDecision(categoryName)
+	}
 
-	// Start PII detection span
-	piiCtx, piiSpan := tracing.StartSpan(ctx.TraceContext, tracing.SpanPIIDetection)
+	// Build content to analyze based on include_history setting
+	contentToAnalyze := []string{}
+	if userContent != "" {
+		contentToAnalyze = append(contentToAnalyze, userContent)
+	}
+	if includeHistory {
+		contentToAnalyze = append(contentToAnalyze, nonUserMessages...)
+	}
+
+	// Start PII plugin span
+	piiCtx, piiSpan := tracing.StartPluginSpan(ctx.TraceContext, "pii", categoryName)
 	piiStart := time.Now()
 
-	detectedPII := r.Classifier.DetectPIIInContent(allContent)
+	detectedPII := r.Classifier.DetectPIIInContent(contentToAnalyze)
 
 	piiTime := time.Since(piiStart).Milliseconds()
 	piiDetected := len(detectedPII) > 0
 
-	tracing.SetSpanAttributes(piiSpan,
-		attribute.Bool(tracing.AttrPIIDetected, piiDetected),
-		attribute.Int64(tracing.AttrPIIDetectionTimeMs, piiTime))
-
+	// Determine plugin status and result
+	var status, result string
 	if piiDetected {
 		piiTypesStr := strings.Join(detectedPII, ",")
-		tracing.SetSpanAttributes(piiSpan,
-			attribute.String(tracing.AttrPIITypes, piiTypesStr))
+		status = "detected"
+		result = "pii_detected:" + piiTypesStr
 		logging.Infof("Detected PII types: %s", piiTypesStr)
+
+		// Keep legacy attributes for backward compatibility
+		tracing.SetSpanAttributes(piiSpan,
+			attribute.Bool(tracing.AttrPIIDetected, true),
+			attribute.String(tracing.AttrPIITypes, piiTypesStr))
+	} else {
+		status = "success"
+		result = "no_pii_detected"
+		tracing.SetSpanAttributes(piiSpan,
+			attribute.Bool(tracing.AttrPIIDetected, false))
 	}
 
-	piiSpan.End()
+	// End plugin span with new architecture
+	tracing.EndPluginSpan(piiSpan, status, piiTime, result)
 	ctx.TraceContext = piiCtx
 
 	return detectedPII
@@ -99,6 +125,9 @@ func (r *OpenAIRouter) checkPIIPolicy(ctx *RequestContext, detectedPII []string,
 	if allowed {
 		return nil
 	}
+
+	// Track PII blocked in context for replay recording
+	ctx.PIIBlocked = true
 
 	// Decision violates PII policy - return error
 	logging.Warnf("Decision %s violates PII policy, blocking request", decisionName)

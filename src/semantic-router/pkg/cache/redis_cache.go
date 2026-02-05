@@ -16,58 +16,15 @@ import (
 	"sigs.k8s.io/yaml"
 
 	candle_binding "github.com/vllm-project/semantic-router/candle-binding"
+	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/config"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/logging"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/metrics"
 )
 
-// RedisConfig defines the complete configuration structure for Redis cache backend.
-type RedisConfig struct {
-	Connection struct {
-		Host     string `json:"host" yaml:"host"`
-		Port     int    `json:"port" yaml:"port"`
-		Database int    `json:"database" yaml:"database"`
-		Password string `json:"password" yaml:"password"`
-		Timeout  int    `json:"timeout" yaml:"timeout"`
-		TLS      struct {
-			Enabled  bool   `json:"enabled" yaml:"enabled"`
-			CertFile string `json:"cert_file" yaml:"cert_file"`
-			KeyFile  string `json:"key_file" yaml:"key_file"`
-			CAFile   string `json:"ca_file" yaml:"ca_file"`
-		} `json:"tls" yaml:"tls"`
-	} `json:"connection" yaml:"connection"`
-	Index struct {
-		Name        string `json:"name" yaml:"name"`
-		Prefix      string `json:"prefix" yaml:"prefix"`
-		VectorField struct {
-			Name       string `json:"name" yaml:"name"`
-			Dimension  int    `json:"dimension" yaml:"dimension"`
-			MetricType string `json:"metric_type" yaml:"metric_type"` // L2, IP, COSINE
-		} `json:"vector_field" yaml:"vector_field"`
-		IndexType string `json:"index_type" yaml:"index_type"` // HNSW or FLAT
-		Params    struct {
-			M              int `json:"M" yaml:"M"`
-			EfConstruction int `json:"efConstruction" yaml:"efConstruction"`
-		} `json:"params" yaml:"params"`
-	} `json:"index" yaml:"index"`
-	Search struct {
-		TopK int `json:"topk" yaml:"topk"`
-	} `json:"search" yaml:"search"`
-	Development struct {
-		DropIndexOnStartup bool `json:"drop_index_on_startup" yaml:"drop_index_on_startup"`
-		AutoCreateIndex    bool `json:"auto_create_index" yaml:"auto_create_index"`
-		VerboseErrors      bool `json:"verbose_errors" yaml:"verbose_errors"`
-	} `json:"development" yaml:"development"`
-	Logging struct {
-		Level          string `json:"level" yaml:"level"`
-		EnableQueryLog bool   `json:"enable_query_log" yaml:"enable_query_log"`
-		EnableMetrics  bool   `json:"enable_metrics" yaml:"enable_metrics"`
-	} `json:"logging" yaml:"logging"`
-}
-
 // RedisCache provides a scalable semantic cache implementation using Redis with vector search
 type RedisCache struct {
 	client              *redis.Client
-	config              *RedisConfig
+	config              *config.RedisConfig
 	indexName           string
 	similarityThreshold float32
 	ttlSeconds          int
@@ -76,6 +33,7 @@ type RedisCache struct {
 	missCount           int64
 	lastCleanupTime     *time.Time
 	mu                  sync.RWMutex
+	embeddingModel      string // "bert", "qwen3", "gemma", or "mmbert"
 }
 
 // RedisCacheOptions contains configuration parameters for Redis cache initialization
@@ -83,7 +41,9 @@ type RedisCacheOptions struct {
 	SimilarityThreshold float32
 	TTLSeconds          int
 	Enabled             bool
+	Config              *config.RedisConfig
 	ConfigPath          string
+	EmbeddingModel      string
 }
 
 // NewRedisCache initializes a new Redis-backed semantic cache instance
@@ -95,33 +55,46 @@ func NewRedisCache(options RedisCacheOptions) (*RedisCache, error) {
 		}, nil
 	}
 
-	// Load Redis configuration from file
-	logging.Debugf("RedisCache: loading config from %s", options.ConfigPath)
-	config, err := loadRedisConfig(options.ConfigPath)
-	if err != nil {
-		logging.Debugf("RedisCache: failed to load config: %v", err)
-		return nil, fmt.Errorf("failed to load Redis config: %w", err)
+	// (Fallback) Load Redis configuration from a separated configuration file
+	var err error
+	var redisConfig *config.RedisConfig
+	if options.Config == nil {
+		logging.Warnf("(Deprecated) RedisCache: loading config from %s", options.ConfigPath)
+		redisConfig, err = loadRedisConfig(options.ConfigPath)
+		if err != nil {
+			logging.Debugf("RedisCache: failed to load config: %v", err)
+			return nil, fmt.Errorf("failed to load Redis config: %w", err)
+		}
+	} else {
+		redisConfig = options.Config
 	}
 	logging.Debugf("RedisCache: config loaded - host=%s:%d, index=%s, dimension=auto-detect",
-		config.Connection.Host, config.Connection.Port, config.Index.Name)
+		redisConfig.Connection.Host, redisConfig.Connection.Port, redisConfig.Index.Name)
 
 	// Establish connection to Redis server
-	logging.Debugf("RedisCache: connecting to Redis at %s:%d", config.Connection.Host, config.Connection.Port)
+	logging.Debugf("RedisCache: connecting to Redis at %s:%d", redisConfig.Connection.Host, redisConfig.Connection.Port)
 
 	redisClient := redis.NewClient(&redis.Options{
-		Addr:     fmt.Sprintf("%s:%d", config.Connection.Host, config.Connection.Port),
-		Password: config.Connection.Password,
-		DB:       config.Connection.Database,
+		Addr:     fmt.Sprintf("%s:%d", redisConfig.Connection.Host, redisConfig.Connection.Port),
+		Password: redisConfig.Connection.Password,
+		DB:       redisConfig.Connection.Database,
 		Protocol: 2, // Use RESP2 protocol for compatibility
 	})
 
+	// Default to "bert" if no embedding model specified
+	embeddingModel := options.EmbeddingModel
+	if embeddingModel == "" {
+		embeddingModel = "bert"
+	}
+
 	cache := &RedisCache{
 		client:              redisClient,
-		config:              config,
-		indexName:           config.Index.Name,
+		config:              redisConfig,
+		indexName:           redisConfig.Index.Name,
 		similarityThreshold: options.SimilarityThreshold,
 		ttlSeconds:          options.TTLSeconds,
 		enabled:             options.Enabled,
+		embeddingModel:      embeddingModel,
 	}
 
 	// Test connection using the new CheckConnection method
@@ -132,7 +105,7 @@ func NewRedisCache(options RedisCacheOptions) (*RedisCache, error) {
 	logging.Debugf("RedisCache: successfully connected to Redis")
 
 	// Set up the index for vector search
-	logging.Debugf("RedisCache: initializing index '%s'", config.Index.Name)
+	logging.Debugf("RedisCache: initializing index '%s'", redisConfig.Index.Name)
 	if err := cache.initializeIndex(); err != nil {
 		logging.Debugf("RedisCache: failed to initialize index: %v", err)
 		redisClient.Close()
@@ -143,8 +116,8 @@ func NewRedisCache(options RedisCacheOptions) (*RedisCache, error) {
 	return cache, nil
 }
 
-// loadRedisConfig reads and parses the Redis configuration from file
-func loadRedisConfig(configPath string) (*RedisConfig, error) {
+// loadRedisConfig reads and parses the Redis configuration from a file (Deprecated)
+func loadRedisConfig(configPath string) (*config.RedisConfig, error) {
 	if configPath == "" {
 		return nil, fmt.Errorf("redis config path is required")
 	}
@@ -156,42 +129,42 @@ func loadRedisConfig(configPath string) (*RedisConfig, error) {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 
-	var config RedisConfig
-	if err := yaml.Unmarshal(data, &config); err != nil {
+	var redisConfig *config.RedisConfig
+	if err := yaml.Unmarshal(data, &redisConfig); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
 	logging.Debugf("Redis config loaded: index=%s, dimension=%d, metric=%s",
-		config.Index.Name, config.Index.VectorField.Dimension, config.Index.VectorField.MetricType)
+		redisConfig.Index.Name, redisConfig.Index.VectorField.Dimension, redisConfig.Index.VectorField.MetricType)
 
 	// Apply defaults
-	if config.Index.VectorField.Name == "" {
-		config.Index.VectorField.Name = "embedding"
+	if redisConfig.Index.VectorField.Name == "" {
+		redisConfig.Index.VectorField.Name = "embedding"
 		logging.Warnf("VectorField.Name not specified, using default: embedding")
 	}
-	if config.Index.VectorField.MetricType == "" {
-		config.Index.VectorField.MetricType = "COSINE"
+	if redisConfig.Index.VectorField.MetricType == "" {
+		redisConfig.Index.VectorField.MetricType = "COSINE"
 	}
-	if config.Index.IndexType == "" {
-		config.Index.IndexType = "HNSW"
+	if redisConfig.Index.IndexType == "" {
+		redisConfig.Index.IndexType = "HNSW"
 	}
-	if config.Index.Prefix == "" {
-		config.Index.Prefix = "doc:"
+	if redisConfig.Index.Prefix == "" {
+		redisConfig.Index.Prefix = "doc:"
 	}
 	// Validate index params for HNSW
-	if config.Index.IndexType == "HNSW" {
-		if config.Index.Params.M == 0 {
-			config.Index.Params.M = 16
+	if redisConfig.Index.IndexType == "HNSW" {
+		if redisConfig.Index.Params.M == 0 {
+			redisConfig.Index.Params.M = 16
 		}
-		if config.Index.Params.EfConstruction == 0 {
-			config.Index.Params.EfConstruction = 64
+		if redisConfig.Index.Params.EfConstruction == 0 {
+			redisConfig.Index.Params.EfConstruction = 64
 		}
 	}
-	if config.Search.TopK == 0 {
-		config.Search.TopK = 1
+	if redisConfig.Search.TopK == 0 {
+		redisConfig.Search.TopK = 1
 	}
 
-	return &config, nil
+	return redisConfig, nil
 }
 
 // initializeIndex sets up the Redis index for vector search
@@ -241,12 +214,46 @@ func (c *RedisCache) initializeIndex() error {
 	return nil
 }
 
+// getEmbedding generates an embedding based on the configured embedding model
+func (c *RedisCache) getEmbedding(text string) ([]float32, error) {
+	modelName := strings.ToLower(strings.TrimSpace(c.embeddingModel))
+
+	switch modelName {
+	case "qwen3":
+		// Use GetEmbeddingBatched for Qwen3 with batching support
+		output, err := candle_binding.GetEmbeddingBatched(text, modelName, 0)
+		if err != nil {
+			return nil, err
+		}
+		return output.Embedding, nil
+	case "gemma":
+		// Use GetEmbeddingWithModelType for Gemma
+		output, err := candle_binding.GetEmbeddingWithModelType(text, modelName, 0)
+		if err != nil {
+			return nil, err
+		}
+		return output.Embedding, nil
+	case "mmbert":
+		// Use GetEmbedding2DMatryoshka for mmBERT
+		output, err := candle_binding.GetEmbedding2DMatryoshka(text, modelName, 0, 0)
+		if err != nil {
+			return nil, err
+		}
+		return output.Embedding, nil
+	case "bert", "":
+		// Use traditional GetEmbedding for BERT (default)
+		return candle_binding.GetEmbedding(text, 0)
+	default:
+		return nil, fmt.Errorf("unsupported embedding model: %s (must be 'bert', 'qwen3', 'gemma', or 'mmbert')", c.embeddingModel)
+	}
+}
+
 // createIndex builds the Redis index with the appropriate schema
 func (c *RedisCache) createIndex() error {
 	ctx := context.Background()
 
 	// Determine embedding dimension automatically
-	testEmbedding, err := candle_binding.GetEmbedding("test", 0)
+	testEmbedding, err := c.getEmbedding("test")
 	if err != nil {
 		return fmt.Errorf("failed to detect embedding dimension: %w", err)
 	}
@@ -496,18 +503,6 @@ func floatsToBytes(fs []float32) []byte {
 	return buf
 }
 
-// escapeRedisTagValue escapes special characters (,.-/ and space) in TAG field values for Redis queries.
-func escapeRedisTagValue(value string) string {
-	replacer := strings.NewReplacer(
-		",", "\\,",
-		".", "\\.",
-		"-", "\\-",
-		"/", "\\/",
-		" ", "\\ ",
-	)
-	return replacer.Replace(value)
-}
-
 // addEntry handles the internal logic for storing entries in Redis
 func (c *RedisCache) addEntry(id string, requestID string, model string, query string, requestBody, responseBody []byte, ttlSeconds int) error {
 	logging.Infof("addEntry called: id='%s', requestID='%s', requestBody_len=%d, responseBody_len=%d, ttl_seconds=%d",
@@ -520,7 +515,7 @@ func (c *RedisCache) addEntry(id string, requestID string, model string, query s
 	}
 
 	// Generate semantic embedding for the query
-	embedding, err := candle_binding.GetEmbedding(query, 0)
+	embedding, err := c.getEmbedding(query)
 	if err != nil {
 		return fmt.Errorf("failed to generate embedding: %w", err)
 	}
@@ -604,7 +599,7 @@ func (c *RedisCache) FindSimilarWithThreshold(model string, query string, thresh
 	logging.Infof("FindSimilarWithThreshold: cache enabled, generating embedding for query")
 
 	// Generate semantic embedding for similarity comparison
-	queryEmbedding, err := candle_binding.GetEmbedding(query, 0)
+	queryEmbedding, err := c.getEmbedding(query)
 	if err != nil {
 		metrics.RecordCacheOperation("redis", "find_similar", "error", time.Since(start).Seconds())
 		return nil, false, fmt.Errorf("failed to generate embedding: %w", err)
@@ -615,10 +610,9 @@ func (c *RedisCache) FindSimilarWithThreshold(model string, query string, thresh
 	// Convert embedding to bytes for Redis query
 	embeddingBytes := floatsToBytes(queryEmbedding)
 
-	// Build KNN query with model filter (TAG fields require escaped values)
-	escapedModel := escapeRedisTagValue(model)
-	knnQuery := fmt.Sprintf("(@model:{%s})=>[KNN %d @%s $vec AS vector_distance]",
-		escapedModel, c.config.Search.TopK, c.config.Index.VectorField.Name)
+	// Build KNN query without model filter (model filtering removed for cross-model cache sharing)
+	knnQuery := fmt.Sprintf("[KNN %d @%s $vec AS vector_distance]",
+		c.config.Search.TopK, c.config.Index.VectorField.Name)
 
 	// Execute vector search
 	searchResult, err := c.client.FTSearchWithArgs(ctx,
@@ -639,7 +633,6 @@ func (c *RedisCache) FindSimilarWithThreshold(model string, query string, thresh
 		logging.Infof("RedisCache.FindSimilarWithThreshold: search failed: %v", err)
 		atomic.AddInt64(&c.missCount, 1)
 		metrics.RecordCacheOperation("redis", "find_similar", "error", time.Since(start).Seconds())
-		metrics.RecordCacheMiss()
 		return nil, false, nil
 	}
 
@@ -649,7 +642,6 @@ func (c *RedisCache) FindSimilarWithThreshold(model string, query string, thresh
 		atomic.AddInt64(&c.missCount, 1)
 		logging.Infof("RedisCache.FindSimilarWithThreshold: no entries found - cache miss")
 		metrics.RecordCacheOperation("redis", "find_similar", "miss", time.Since(start).Seconds())
-		metrics.RecordCacheMiss()
 		return nil, false, nil
 	}
 
@@ -665,7 +657,6 @@ func (c *RedisCache) FindSimilarWithThreshold(model string, query string, thresh
 		logging.Infof("RedisCache.FindSimilarWithThreshold: vector_distance field not found in result")
 		atomic.AddInt64(&c.missCount, 1)
 		metrics.RecordCacheOperation("redis", "find_similar", "error", time.Since(start).Seconds())
-		metrics.RecordCacheMiss()
 		return nil, false, nil
 	}
 
@@ -674,7 +665,6 @@ func (c *RedisCache) FindSimilarWithThreshold(model string, query string, thresh
 		logging.Infof("RedisCache.FindSimilarWithThreshold: failed to parse distance value: %v", err)
 		atomic.AddInt64(&c.missCount, 1)
 		metrics.RecordCacheOperation("redis", "find_similar", "error", time.Since(start).Seconds())
-		metrics.RecordCacheMiss()
 		return nil, false, nil
 	}
 
@@ -710,7 +700,6 @@ func (c *RedisCache) FindSimilarWithThreshold(model string, query string, thresh
 			"index":           c.indexName,
 		})
 		metrics.RecordCacheOperation("redis", "find_similar", "miss", time.Since(start).Seconds())
-		metrics.RecordCacheMiss()
 		return nil, false, nil
 	}
 
@@ -721,7 +710,6 @@ func (c *RedisCache) FindSimilarWithThreshold(model string, query string, thresh
 		logging.Infof("RedisCache.FindSimilarWithThreshold: cache hit BUT response_body field is MISSING - treating as miss")
 		atomic.AddInt64(&c.missCount, 1)
 		metrics.RecordCacheOperation("redis", "find_similar", "error", time.Since(start).Seconds())
-		metrics.RecordCacheMiss()
 		return nil, false, nil
 	}
 
@@ -730,7 +718,6 @@ func (c *RedisCache) FindSimilarWithThreshold(model string, query string, thresh
 		logging.Infof("RedisCache.FindSimilarWithThreshold: cache hit BUT response_body is EMPTY - treating as miss")
 		atomic.AddInt64(&c.missCount, 1)
 		metrics.RecordCacheOperation("redis", "find_similar", "error", time.Since(start).Seconds())
-		metrics.RecordCacheMiss()
 		return nil, false, nil
 	}
 
@@ -749,7 +736,6 @@ func (c *RedisCache) FindSimilarWithThreshold(model string, query string, thresh
 		"index":      c.indexName,
 	})
 	metrics.RecordCacheOperation("redis", "find_similar", "hit", time.Since(start).Seconds())
-	metrics.RecordCacheHit()
 	return responseBody, true, nil
 }
 

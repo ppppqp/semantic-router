@@ -6,11 +6,13 @@ import ViewModal, { ViewSection } from '../components/ViewModal'
 import { DataTable, Column } from '../components/DataTable'
 import TableHeader from '../components/TableHeader'
 import EndpointsEditor, { Endpoint } from '../components/EndpointsEditor'
+import { useReadonly } from '../contexts/ReadonlyContext'
 import {
   ConfigFormat,
   detectConfigFormat,
   DecisionConditionType
 } from '../types/config'
+import { MCPConfigPanel } from '../components/MCPConfigPanel'
 
 interface VLLMEndpoint {
   name: string
@@ -25,6 +27,7 @@ interface ModelConfig {
   use_modernbert?: boolean
   threshold: number
   use_cpu: boolean
+  use_qwen3?: boolean
   category_mapping_path?: string
   pii_mapping_path?: string
   jailbreak_mapping_path?: string
@@ -162,6 +165,19 @@ interface ConfigData {
     user_feedbacks?: Array<{ name: string; description: string }>
     preferences?: Array<{ name: string; description: string }>
     language?: Array<{ name: string }>
+    latency?: Array<{ name: string; tpot_percentile?: number; ttft_percentile?: number; description?: string }>
+    context?: Array<{ name: string; min_tokens: string; max_tokens: string; description?: string }>
+    complexity?: Array<{
+      name: string
+      threshold: number
+      hard: { candidates: string[] }
+      easy: { candidates: string[] }
+      description?: string
+      composer?: {
+        operator: 'AND' | 'OR'
+        conditions: Array<{ type: string; name: string }>
+      }
+    }>
   }
   decisions?: Array<{
     name: string
@@ -216,6 +232,7 @@ interface ConfigData {
     category_model?: ModelConfig
     mcp_category_model?: MCPCategoryModel
     pii_model?: ModelConfig
+    preference_model?: ModelConfig
   }
   categories?: Category[]
   default_reasoning_effort?: string
@@ -234,7 +251,7 @@ interface ConfigPageProps {
   activeSection?: ConfigSection
 }
 
-type SignalType = 'Keywords' | 'Embeddings' | 'Domain' | 'Preference' | 'Fact Check' | 'User Feedback' | 'Language'
+type SignalType = 'Keywords' | 'Embeddings' | 'Domain' | 'Preference' | 'Fact Check' | 'User Feedback' | 'Language' | 'Latency' | 'Context' | 'Complexity'
 type DecisionConfig = NonNullable<ConfigData['decisions']>[number]
 
 interface DecisionFormState {
@@ -258,6 +275,15 @@ interface AddSignalFormState {
   candidates: string
   aggregation_method: string
   mmlu_categories: string
+  tpot_percentile?: number
+  ttft_percentile?: number
+  min_tokens?: string
+  max_tokens?: string
+  complexity_threshold?: number
+  hard_candidates?: string
+  easy_candidates?: string
+  composer_operator?: 'AND' | 'OR'
+  composer_conditions?: string
 }
 
 // Helper function to format threshold as percentage
@@ -268,6 +294,7 @@ const formatThreshold = (value: number): string => {
 // Removed maskAddress - no longer needed after removing endpoint visibility toggle
 
 const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) => {
+  const { isReadonly } = useReadonly()
   const [config, setConfig] = useState<ConfigData | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -380,6 +407,11 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const saveConfig = async (updatedConfig: any) => {
+    // Prevent save in read-only mode
+    if (isReadonly) {
+      throw new Error('Dashboard is in read-only mode. Configuration editing is disabled.')
+    }
+
     try {
       const response = await fetch('/api/router/config/update', {
         method: 'POST',
@@ -467,6 +499,18 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
         break
       case 'User Feedback':
         cfg.signals.user_feedbacks = (cfg.signals.user_feedbacks || []).filter(s => s.name !== targetName)
+        break
+      case 'Language':
+        cfg.signals.language = (cfg.signals.language || []).filter(s => s.name !== targetName)
+        break
+      case 'Latency':
+        cfg.signals.latency = (cfg.signals.latency || []).filter(s => s.name !== targetName)
+        break
+      case 'Context':
+        cfg.signals.context = (cfg.signals.context || []).filter(s => s.name !== targetName)
+        break
+      case 'Complexity':
+        cfg.signals.complexity = (cfg.signals.complexity || []).filter(s => s.name !== targetName)
         break
       default:
         break
@@ -640,7 +684,7 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
     <div className={styles.section}>
       <div className={styles.sectionHeader}>
         <h3 className={styles.sectionTitle}>PII Detection (ModernBERT)</h3>
-        {routerConfig.classifier?.pii_model && (
+        {routerConfig.classifier?.pii_model && !isReadonly && (
           <button
             className={styles.sectionEditButton}
             onClick={() => {
@@ -741,7 +785,7 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
     <div className={styles.section}>
       <div className={styles.sectionHeader}>
         <h3 className={styles.sectionTitle}>Jailbreak Detection (ModernBERT)</h3>
-        {routerConfig.prompt_guard && (
+        {routerConfig.prompt_guard && !isReadonly && (
           <button
             className={styles.sectionEditButton}
             onClick={() => {
@@ -860,7 +904,7 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
       <div className={styles.section}>
         <div className={styles.sectionHeader}>
           <h3 className={styles.sectionTitle}>Similarity BERT Configuration</h3>
-          {routerConfig.bert_model && (
+          {routerConfig.bert_model && !isReadonly && (
             <button
               className={styles.sectionEditButton}
               onClick={() => {
@@ -936,67 +980,69 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
                   <span className={`${styles.statusBadge} ${routerConfig.semantic_cache?.enabled ? styles.statusActive : styles.statusInactive}`}>
                     {routerConfig.semantic_cache?.enabled ? '✓ Enabled' : '✗ Disabled'}
                   </span>
-                  <button
-                    className={styles.sectionEditButton}
-                    onClick={() => {
-                      openEditModal(
-                        'Edit Semantic Cache Configuration',
-                        config?.semantic_cache || {},
-                        [
-                          {
-                            name: 'enabled',
-                            label: 'Enable Semantic Cache',
-                            type: 'boolean',
-                            description: 'Enable or disable semantic caching'
-                          },
-                          {
-                            name: 'backend_type',
-                            label: 'Backend Type',
-                            type: 'select',
-                            options: ['memory', 'redis', 'memcached'],
-                            description: 'Cache backend storage type'
-                          },
-                          {
-                            name: 'similarity_threshold',
-                            label: 'Similarity Threshold',
-                            type: 'percentage',
-                            required: true,
-                            placeholder: '90',
-                            description: 'Minimum similarity score for cache hits (0-100%)',
-                            step: 1
-                          },
-                          {
-                            name: 'max_entries',
-                            label: 'Max Entries',
-                            type: 'number',
-                            placeholder: '10000',
-                            description: 'Maximum number of cached entries'
-                          },
-                          {
-                            name: 'ttl_seconds',
-                            label: 'TTL (seconds)',
-                            type: 'number',
-                            placeholder: '3600',
-                            description: 'Time-to-live for cached entries'
-                          },
-                          {
-                            name: 'eviction_policy',
-                            label: 'Eviction Policy',
-                            type: 'select',
-                            options: ['lru', 'lfu', 'fifo'],
-                            description: 'Cache eviction policy when max entries reached'
+                  {!isReadonly && (
+                    <button
+                      className={styles.sectionEditButton}
+                      onClick={() => {
+                        openEditModal(
+                          'Edit Semantic Cache Configuration',
+                          config?.semantic_cache || {},
+                          [
+                            {
+                              name: 'enabled',
+                              label: 'Enable Semantic Cache',
+                              type: 'boolean',
+                              description: 'Enable or disable semantic caching'
+                            },
+                            {
+                              name: 'backend_type',
+                              label: 'Backend Type',
+                              type: 'select',
+                              options: ['memory', 'redis', 'memcached'],
+                              description: 'Cache backend storage type'
+                            },
+                            {
+                              name: 'similarity_threshold',
+                              label: 'Similarity Threshold',
+                              type: 'percentage',
+                              required: true,
+                              placeholder: '90',
+                              description: 'Minimum similarity score for cache hits (0-100%)',
+                              step: 1
+                            },
+                            {
+                              name: 'max_entries',
+                              label: 'Max Entries',
+                              type: 'number',
+                              placeholder: '10000',
+                              description: 'Maximum number of cached entries'
+                            },
+                            {
+                              name: 'ttl_seconds',
+                              label: 'TTL (seconds)',
+                              type: 'number',
+                              placeholder: '3600',
+                              description: 'Time-to-live for cached entries'
+                            },
+                            {
+                              name: 'eviction_policy',
+                              label: 'Eviction Policy',
+                              type: 'select',
+                              options: ['lru', 'lfu', 'fifo'],
+                              description: 'Cache eviction policy when max entries reached'
+                            }
+                          ],
+                          async (data) => {
+                            const newConfig = { ...config }
+                            newConfig.semantic_cache = data
+                            await saveConfig(newConfig)
                           }
-                        ],
-                        async (data) => {
-                          const newConfig = { ...config }
-                          newConfig.semantic_cache = data
-                          await saveConfig(newConfig)
-                        }
-                      )
-                    }}
-                  >
-                    Edit
-                  </button>
+                        )
+                      }}
+                    >
+                      Edit
+                    </button>
+                  )}
                 </div>
               </div>
               {routerConfig.semantic_cache?.enabled && (
@@ -1055,61 +1101,63 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
                   <span className={`${styles.statusBadge} ${styles.statusActive}`}>
                     {routerConfig.classifier.category_model.use_cpu ? 'CPU' : 'GPU'}
                   </span>
-                  <button
-                    className={styles.editButton}
-                    onClick={() => {
-                      openEditModal(
-                        'Edit In-tree Category Classifier',
-                        routerConfig.classifier?.category_model || {},
-                        [
-                          {
-                            name: 'model_id',
-                            label: 'Model ID',
-                            type: 'text',
-                            required: true,
-                            placeholder: 'e.g., answerdotai/ModernBERT-base',
-                            description: 'HuggingFace model ID for category classification'
-                          },
-                          {
-                            name: 'threshold',
-                            label: 'Classification Threshold',
-                            type: 'percentage',
-                            required: true,
-                            placeholder: '70',
-                            description: 'Confidence threshold for category classification (0-100%)',
-                            step: 1
-                          },
-                          {
-                            name: 'use_cpu',
-                            label: 'Use CPU',
-                            type: 'boolean',
-                            description: 'Use CPU instead of GPU for inference'
-                          },
-                          {
-                            name: 'use_modernbert',
-                            label: 'Use ModernBERT',
-                            type: 'boolean',
-                            description: 'Enable ModernBERT-based classification'
-                          },
-                          {
-                            name: 'category_mapping_path',
-                            label: 'Category Mapping Path',
-                            type: 'text',
-                            placeholder: 'config/category_mapping.json',
-                            description: 'Path to category mapping configuration'
+                  {!isReadonly && (
+                    <button
+                      className={styles.editButton}
+                      onClick={() => {
+                        openEditModal(
+                          'Edit In-tree Category Classifier',
+                          routerConfig.classifier?.category_model || {},
+                          [
+                            {
+                              name: 'model_id',
+                              label: 'Model ID',
+                              type: 'text',
+                              required: true,
+                              placeholder: 'e.g., answerdotai/ModernBERT-base',
+                              description: 'HuggingFace model ID for category classification'
+                            },
+                            {
+                              name: 'threshold',
+                              label: 'Classification Threshold',
+                              type: 'percentage',
+                              required: true,
+                              placeholder: '70',
+                              description: 'Confidence threshold for category classification (0-100%)',
+                              step: 1
+                            },
+                            {
+                              name: 'use_cpu',
+                              label: 'Use CPU',
+                              type: 'boolean',
+                              description: 'Use CPU instead of GPU for inference'
+                            },
+                            {
+                              name: 'use_modernbert',
+                              label: 'Use ModernBERT',
+                              type: 'boolean',
+                              description: 'Enable ModernBERT-based classification'
+                            },
+                            {
+                              name: 'category_mapping_path',
+                              label: 'Category Mapping Path',
+                              type: 'text',
+                              placeholder: 'config/category_mapping.json',
+                              description: 'Path to category mapping configuration'
+                            }
+                          ],
+                          async (data) => {
+                            const newConfig = { ...config }
+                            if (!newConfig.classifier) newConfig.classifier = {}
+                            newConfig.classifier.category_model = data
+                            await saveConfig(newConfig)
                           }
-                        ],
-                        async (data) => {
-                          const newConfig = { ...config }
-                          if (!newConfig.classifier) newConfig.classifier = {}
-                          newConfig.classifier.category_model = data
-                          await saveConfig(newConfig)
-                        }
-                      )
-                    }}
-                  >
+                        )
+                      }}
+                    >
 
-                  </button>
+                    </button>
+                  )}
                 </div>
               </div>
               <div className={styles.modelCardBody}>
@@ -1148,90 +1196,92 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
                 <span className={styles.modelCardTitle}>Out-tree Category Classifier (MCP)</span>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
                   <span className={`${styles.statusBadge} ${styles.statusActive}`}>✓ Enabled</span>
-                  <button
-                    className={styles.editButton}
-                    onClick={() => {
-                      openEditModal(
-                        'Edit Out-tree MCP Category Classifier',
-                        routerConfig.classifier?.mcp_category_model || {},
-                        [
-                          {
-                            name: 'enabled',
-                            label: 'Enable MCP Classifier',
-                            type: 'boolean',
-                            description: 'Enable or disable MCP-based classification'
-                          },
-                          {
-                            name: 'transport_type',
-                            label: 'Transport Type',
-                            type: 'select',
-                            options: ['stdio', 'http'],
-                            required: true,
-                            description: 'MCP transport protocol type'
-                          },
-                          {
-                            name: 'command',
-                            label: 'Command',
-                            type: 'text',
-                            placeholder: 'e.g., python mcp_server.py',
-                            description: 'Command to start MCP server (for stdio transport)'
-                          },
-                          {
-                            name: 'args',
-                            label: 'Arguments (JSON)',
-                            type: 'json',
-                            placeholder: '["--port", "8080"]',
-                            description: 'Command line arguments as JSON array'
-                          },
-                          {
-                            name: 'env',
-                            label: 'Environment Variables (JSON)',
-                            type: 'json',
-                            placeholder: '{"API_KEY": "xxx"}',
-                            description: 'Environment variables as JSON object'
-                          },
-                          {
-                            name: 'url',
-                            label: 'URL',
-                            type: 'text',
-                            placeholder: 'http://localhost:8080',
-                            description: 'MCP server URL (for http transport)'
-                          },
-                          {
-                            name: 'tool_name',
-                            label: 'Tool Name',
-                            type: 'text',
-                            placeholder: 'classify_category',
-                            description: 'Name of the MCP tool to call'
-                          },
-                          {
-                            name: 'threshold',
-                            label: 'Classification Threshold',
-                            type: 'percentage',
-                            required: true,
-                            placeholder: '70',
-                            description: 'Confidence threshold for classification (0-100%)',
-                            step: 1
-                          },
-                          {
-                            name: 'timeout_seconds',
-                            label: 'Timeout (seconds)',
-                            type: 'number',
-                            placeholder: '30',
-                            description: 'Request timeout in seconds'
+                  {!isReadonly && (
+                    <button
+                      className={styles.editButton}
+                      onClick={() => {
+                        openEditModal(
+                          'Edit Out-tree MCP Category Classifier',
+                          routerConfig.classifier?.mcp_category_model || {},
+                          [
+                            {
+                              name: 'enabled',
+                              label: 'Enable MCP Classifier',
+                              type: 'boolean',
+                              description: 'Enable or disable MCP-based classification'
+                            },
+                            {
+                              name: 'transport_type',
+                              label: 'Transport Type',
+                              type: 'select',
+                              options: ['stdio', 'http'],
+                              required: true,
+                              description: 'MCP transport protocol type'
+                            },
+                            {
+                              name: 'command',
+                              label: 'Command',
+                              type: 'text',
+                              placeholder: 'e.g., python mcp_server.py',
+                              description: 'Command to start MCP server (for stdio transport)'
+                            },
+                            {
+                              name: 'args',
+                              label: 'Arguments (JSON)',
+                              type: 'json',
+                              placeholder: '["--port", "8080"]',
+                              description: 'Command line arguments as JSON array'
+                            },
+                            {
+                              name: 'env',
+                              label: 'Environment Variables (JSON)',
+                              type: 'json',
+                              placeholder: '{"API_KEY": "xxx"}',
+                              description: 'Environment variables as JSON object'
+                            },
+                            {
+                              name: 'url',
+                              label: 'URL',
+                              type: 'text',
+                              placeholder: 'http://localhost:8080',
+                              description: 'MCP server URL (for http transport)'
+                            },
+                            {
+                              name: 'tool_name',
+                              label: 'Tool Name',
+                              type: 'text',
+                              placeholder: 'classify_category',
+                              description: 'Name of the MCP tool to call'
+                            },
+                            {
+                              name: 'threshold',
+                              label: 'Classification Threshold',
+                              type: 'percentage',
+                              required: true,
+                              placeholder: '70',
+                              description: 'Confidence threshold for classification (0-100%)',
+                              step: 1
+                            },
+                            {
+                              name: 'timeout_seconds',
+                              label: 'Timeout (seconds)',
+                              type: 'number',
+                              placeholder: '30',
+                              description: 'Request timeout in seconds'
+                            }
+                          ],
+                          async (data) => {
+                            const newConfig = { ...config }
+                            if (!newConfig.classifier) newConfig.classifier = {}
+                            newConfig.classifier.mcp_category_model = data
+                            await saveConfig(newConfig)
                           }
-                        ],
-                        async (data) => {
-                          const newConfig = { ...config }
-                          if (!newConfig.classifier) newConfig.classifier = {}
-                          newConfig.classifier.mcp_category_model = data
-                          await saveConfig(newConfig)
-                        }
-                      )
-                    }}
-                  >
+                        )
+                      }}
+                    >
 
-                  </button>
+                    </button>
+                  )}
                 </div>
               </div>
               <div className={styles.modelCardBody}>
@@ -1283,6 +1333,105 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
     )
   }
 
+  // ============================================================================
+  // 4b. PREFERENCE MODEL SECTION (LOCAL CANDLE)
+  // ============================================================================
+
+  const renderPreferenceModel = () => {
+    const preferenceModel = routerConfig.classifier?.preference_model
+
+    return (
+      <div className={styles.section}>
+        <div className={styles.sectionHeader}>
+          <h3 className={styles.sectionTitle}>Preference Model (Work In Progress)</h3>
+          <button
+            className={styles.sectionEditButton}
+            onClick={() => {
+              openEditModal(
+                preferenceModel ? 'Edit Preference Model' : 'Add Preference Model',
+                preferenceModel || {
+                  model_id: '',
+                  threshold: 0,
+                  use_cpu: false,
+                  use_qwen3: true,
+                },
+                [
+                  {
+                    name: 'model_id',
+                    label: 'Model ID or Path',
+                    type: 'text',
+                    required: true,
+                    placeholder: '',
+                    description: 'Local Candle model path or HuggingFace ID for preference routing',
+                  },
+                  {
+                    name: 'threshold',
+                    label: 'Confidence Threshold',
+                    type: 'percentage',
+                    placeholder: '0',
+                    description: 'Minimum confidence to accept a preference (0-100%, optional)',
+                    step: 1,
+                  },
+                  {
+                    name: 'use_cpu',
+                    label: 'Use CPU',
+                    type: 'boolean',
+                    description: 'Force CPU inference instead of GPU/Metal when available',
+                  },
+                  {
+                    name: 'use_qwen3',
+                    label: 'Use Qwen3 Model',
+                    type: 'boolean',
+                    description: 'Enable Qwen3 zero-shot/fine-tuned preference classifier',
+                  },
+                ],
+                async (data) => {
+                  const newConfig = { ...config }
+                  if (!newConfig.classifier) newConfig.classifier = {}
+                  newConfig.classifier.preference_model = data
+                  await saveConfig(newConfig)
+                },
+                preferenceModel ? 'edit' : 'add'
+              )
+            }}
+          >
+            {preferenceModel ? 'Edit' : 'Add'}
+          </button>
+        </div>
+        <div className={styles.sectionContent}>
+          {preferenceModel ? (
+            <div className={styles.modelCard}>
+              <div className={styles.modelCardHeader}>
+                <span className={styles.modelCardTitle}>Local Preference Classifier</span>
+                <span className={`${styles.statusBadge} ${styles.statusActive}`}>
+                  {preferenceModel.use_cpu ? 'CPU' : 'GPU'}
+                </span>
+              </div>
+              <div className={styles.modelCardBody}>
+                <div className={styles.configRow}>
+                  <span className={styles.configLabel}>Model ID</span>
+                  <span className={styles.configValue}>{preferenceModel.model_id}</span>
+                </div>
+                <div className={styles.configRow}>
+                  <span className={styles.configLabel}>Threshold</span>
+                  <span className={styles.configValue}>{formatThreshold(preferenceModel.threshold || 0)}</span>
+                </div>
+                <div className={styles.configRow}>
+                  <span className={styles.configLabel}>Qwen3</span>
+                  <span className={`${styles.statusBadge} ${preferenceModel.use_qwen3 ? styles.statusActive : styles.statusInactive}`}>
+                    {preferenceModel.use_qwen3 ? '✓ Enabled' : '✗ Disabled'}
+                  </span>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className={styles.emptyState}>Preference model not configured</div>
+          )}
+        </div>
+      </div>
+    )
+  }
+
   const renderCategories = () => {
     // Get domains/categories from both formats
     const domains = getDomains()
@@ -1323,36 +1472,38 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
                     <div key={index} className={styles.categoryCard}>
                       <div className={styles.categoryHeader}>
                         <span className={styles.categoryName}>{domain.name}</span>
-                        <button
-                          className={styles.editButton}
-                          onClick={() => {
-                            openEditModal(
-                              `Edit Domain: ${domain.name}`,
-                              { description: domain.description || '' },
-                              [
-                                {
-                                  name: 'description',
-                                  label: 'Description',
-                                  type: 'textarea',
-                                  placeholder: 'Describe this domain...',
-                                  description: 'What types of queries belong to this domain'
-                                }
-                              ],
-                              async (data) => {
-                                const newConfig = { ...config }
-                                if (newConfig.signals?.domains) {
-                                  newConfig.signals.domains[index] = {
-                                    ...domain,
-                                    description: data.description,
+                        {!isReadonly && (
+                          <button
+                            className={styles.editButton}
+                            onClick={() => {
+                              openEditModal(
+                                `Edit Domain: ${domain.name}`,
+                                { description: domain.description || '' },
+                                [
+                                  {
+                                    name: 'description',
+                                    label: 'Description',
+                                    type: 'textarea',
+                                    placeholder: 'Describe this domain...',
+                                    description: 'What types of queries belong to this domain'
                                   }
+                                ],
+                                async (data) => {
+                                  const newConfig = { ...config }
+                                  if (newConfig.signals?.domains) {
+                                    newConfig.signals.domains[index] = {
+                                      ...domain,
+                                      description: data.description,
+                                    }
+                                  }
+                                  await saveConfig(newConfig)
                                 }
-                                await saveConfig(newConfig)
-                              }
-                            )
-                          }}
-                        >
+                              )
+                            }}
+                          >
 
-                        </button>
+                          </button>
+                        )}
                       </div>
                       {domain.description && (
                         <p className={styles.categoryDescription}>{domain.description}</p>
@@ -1434,38 +1585,40 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
                               {reasoningEffort}
                             </span>
                           )}
-                          <button
-                            className={styles.editButton}
-                            onClick={() => {
-                              openEditModal(
-                                `Edit Category: ${category.name}`,
-                                {
-                                  system_prompt: category.system_prompt || ''
-                                },
-                                [
+                          {!isReadonly && (
+                            <button
+                              className={styles.editButton}
+                              onClick={() => {
+                                openEditModal(
+                                  `Edit Category: ${category.name}`,
                                   {
-                                    name: 'system_prompt',
-                                    label: 'System Prompt',
-                                    type: 'textarea',
-                                    placeholder: 'Enter system prompt for this category...',
-                                    description: 'Instructions for the model when handling this category'
-                                  }
-                                ],
-                                async (data) => {
-                                  const newConfig = { ...config }
-                                  if (newConfig.categories) {
-                                    newConfig.categories[index] = {
-                                      ...category,
-                                      ...data
+                                    system_prompt: category.system_prompt || ''
+                                  },
+                                  [
+                                    {
+                                      name: 'system_prompt',
+                                      label: 'System Prompt',
+                                      type: 'textarea',
+                                      placeholder: 'Enter system prompt for this category...',
+                                      description: 'Instructions for the model when handling this category'
                                     }
+                                  ],
+                                  async (data) => {
+                                    const newConfig = { ...config }
+                                    if (newConfig.categories) {
+                                      newConfig.categories[index] = {
+                                        ...category,
+                                        ...data
+                                      }
+                                    }
+                                    await saveConfig(newConfig)
                                   }
-                                  await saveConfig(newConfig)
-                                }
-                              )
-                            }}
-                          >
+                                )
+                              }}
+                            >
 
-                          </button>
+                            </button>
+                          )}
                         </div>
                       </div>
 
@@ -1484,63 +1637,65 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
                       <div className={styles.categoryModels}>
                         <div className={styles.categoryModelsHeader}>
                           <span>Model Scores</span>
-                          <button
-                            className={styles.addModelButton}
-                            onClick={() => {
-                              // Get available models from model_config
-                              const availableModels = config?.model_config
-                                ? Object.keys(config.model_config)
-                                : []
+                          {!isReadonly && (
+                            <button
+                              className={styles.addModelButton}
+                              onClick={() => {
+                                // Get available models from model_config
+                                const availableModels = config?.model_config
+                                  ? Object.keys(config.model_config)
+                                  : []
 
-                              openEditModal(
-                                `Add Model to ${category.name}`,
-                                {
-                                  model: availableModels[0] || '',
-                                  score: 0.5,
-                                  use_reasoning: false
-                                },
-                                [
+                                openEditModal(
+                                  `Add Model to ${category.name}`,
                                   {
-                                    name: 'model',
-                                    label: 'Model',
-                                    type: 'select',
-                                    options: availableModels,
-                                    required: true,
-                                    description: 'Select from configured models'
+                                    model: availableModels[0] || '',
+                                    score: 0.5,
+                                    use_reasoning: false
                                   },
-                                  {
-                                    name: 'score',
-                                    label: 'Score',
-                                    type: 'number',
-                                    required: true,
-                                    placeholder: '0.5',
-                                    description: 'Model score (0-1)'
+                                  [
+                                    {
+                                      name: 'model',
+                                      label: 'Model',
+                                      type: 'select',
+                                      options: availableModels,
+                                      required: true,
+                                      description: 'Select from configured models'
+                                    },
+                                    {
+                                      name: 'score',
+                                      label: 'Score',
+                                      type: 'number',
+                                      required: true,
+                                      placeholder: '0.5',
+                                      description: 'Model score (0-1)'
+                                    },
+                                    {
+                                      name: 'use_reasoning',
+                                      label: 'Use Reasoning',
+                                      type: 'boolean',
+                                      description: 'Enable reasoning for this model in this category'
+                                    }
+                                  ],
+                                  async (data) => {
+                                    const newConfig = { ...config }
+                                    if (newConfig.categories) {
+                                      const updatedCategory = { ...category }
+                                      // Convert to array format if needed (Legacy uses object)
+                                      const scores = normalizeModelScores(updatedCategory.model_scores)
+                                      scores.push(data)
+                                      updatedCategory.model_scores = scores
+                                      newConfig.categories[index] = updatedCategory
+                                    }
+                                    await saveConfig(newConfig)
                                   },
-                                  {
-                                    name: 'use_reasoning',
-                                    label: 'Use Reasoning',
-                                    type: 'boolean',
-                                    description: 'Enable reasoning for this model in this category'
-                                  }
-                                ],
-                                async (data) => {
-                                  const newConfig = { ...config }
-                                  if (newConfig.categories) {
-                                    const updatedCategory = { ...category }
-                                    // Convert to array format if needed (Legacy uses object)
-                                    const scores = normalizeModelScores(updatedCategory.model_scores)
-                                    scores.push(data)
-                                    updatedCategory.model_scores = scores
-                                    newConfig.categories[index] = updatedCategory
-                                  }
-                                  await saveConfig(newConfig)
-                                },
-                                'add'
-                              )
-                            }}
-                          >
+                                  'add'
+                                )
+                              }}
+                            >
 
-                          </button>
+                            </button>
+                          )}
                         </div>
                         {normalizedScores.length > 0 ? (
                           normalizedScores.map((modelScore, modelIdx) => (
@@ -1557,78 +1712,82 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
                                 <span className={styles.scoreText}>{((modelScore.score ?? 0) * 100).toFixed(0)}%</span>
                               </div>
                               <div className={styles.modelScoreActions}>
-                                <button
-                                  className={styles.editButton}
-                                  onClick={() => {
-                                    // Get available models from model_config
-                                    const availableModels = config?.model_config
-                                      ? Object.keys(config.model_config)
-                                      : []
+                                {!isReadonly && (
+                                  <>
+                                    <button
+                                      className={styles.editButton}
+                                      onClick={() => {
+                                        // Get available models from model_config
+                                        const availableModels = config?.model_config
+                                          ? Object.keys(config.model_config)
+                                          : []
 
-                                    openEditModal(
-                                      `Edit Model: ${modelScore.model}`,
-                                      { ...modelScore },
-                                      [
-                                        {
-                                          name: 'model',
-                                          label: 'Model',
-                                          type: 'select',
-                                          options: availableModels,
-                                          required: true,
-                                          description: 'Select from configured models'
-                                        },
-                                        {
-                                          name: 'score',
-                                          label: 'Score',
-                                          type: 'number',
-                                          required: true,
-                                          placeholder: '0.5',
-                                          description: 'Model score (0-1)'
-                                        },
-                                        {
-                                          name: 'use_reasoning',
-                                          label: 'Use Reasoning',
-                                          type: 'boolean',
-                                          description: 'Enable reasoning for this model in this category'
+                                        openEditModal(
+                                          `Edit Model: ${modelScore.model}`,
+                                          { ...modelScore },
+                                          [
+                                            {
+                                              name: 'model',
+                                              label: 'Model',
+                                              type: 'select',
+                                              options: availableModels,
+                                              required: true,
+                                              description: 'Select from configured models'
+                                            },
+                                            {
+                                              name: 'score',
+                                              label: 'Score',
+                                              type: 'number',
+                                              required: true,
+                                              placeholder: '0.5',
+                                              description: 'Model score (0-1)'
+                                            },
+                                            {
+                                              name: 'use_reasoning',
+                                              label: 'Use Reasoning',
+                                              type: 'boolean',
+                                              description: 'Enable reasoning for this model in this category'
+                                            }
+                                          ],
+                                          async (data) => {
+                                            // For legacy object format, we need to convert back
+                                            const newConfig = { ...config }
+                                            if (newConfig.categories) {
+                                              const updatedCategory = { ...category }
+                                              // Convert to array format for consistency
+                                              const scores = normalizeModelScores(updatedCategory.model_scores)
+                                              scores[modelIdx] = data
+                                              updatedCategory.model_scores = scores
+                                              newConfig.categories[index] = updatedCategory
+                                            }
+                                            await saveConfig(newConfig)
+                                          }
+                                        )
+                                      }}
+                                    >
+
+                                    </button>
+                                    <button
+                                      className={styles.deleteButton}
+                                      onClick={() => {
+                                        if (confirm(`Remove model "${modelScore.model}" from this category?`)) {
+                                          const newConfig = { ...config }
+                                          if (newConfig.categories) {
+                                            const updatedCategory = { ...category }
+                                            // Convert to array format for consistency
+                                            const scores = normalizeModelScores(updatedCategory.model_scores)
+                                            scores.splice(modelIdx, 1)
+                                            updatedCategory.model_scores = scores
+                                            newConfig.categories[index] = updatedCategory
+                                          }
+                                          saveConfig(newConfig)
                                         }
-                                      ],
-                                      async (data) => {
-                                        // For legacy object format, we need to convert back
-                                        const newConfig = { ...config }
-                                        if (newConfig.categories) {
-                                          const updatedCategory = { ...category }
-                                          // Convert to array format for consistency
-                                          const scores = normalizeModelScores(updatedCategory.model_scores)
-                                          scores[modelIdx] = data
-                                          updatedCategory.model_scores = scores
-                                          newConfig.categories[index] = updatedCategory
-                                        }
-                                        await saveConfig(newConfig)
-                                      }
-                                    )
-                                  }}
-                                >
+                                      }}
+                                    >
 
-                                </button>
-                                <button
-                                  className={styles.deleteButton}
-                                  onClick={() => {
-                                    if (confirm(`Remove model "${modelScore.model}" from this category?`)) {
-                                      const newConfig = { ...config }
-                                      if (newConfig.categories) {
-                                        const updatedCategory = { ...category }
-                                        // Convert to array format for consistency
-                                        const scores = normalizeModelScores(updatedCategory.model_scores)
-                                        scores.splice(modelIdx, 1)
-                                        updatedCategory.model_scores = scores
-                                        newConfig.categories[index] = updatedCategory
-                                      }
-                                      saveConfig(newConfig)
-                                    }
-                                  }}
-                                >
-
-                                </button>
+                                    </button>
+                                  </>
+                                )}
                               </div>
                             </div>
                           ))
@@ -1659,7 +1818,7 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
     <div className={styles.section}>
       <div className={styles.sectionHeader}>
         <h3 className={styles.sectionTitle}>Tools Configuration</h3>
-        {routerConfig.tools && (
+        {routerConfig.tools && !isReadonly && (
           <button
             className={styles.sectionEditButton}
             onClick={() => {
@@ -1846,7 +2005,7 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
     <div className={styles.section}>
       <div className={styles.sectionHeader}>
         <h3 className={styles.sectionTitle}>Distributed Tracing</h3>
-        {routerConfig.observability?.tracing && (
+        {routerConfig.observability?.tracing && !isReadonly && (
           <button
             className={styles.sectionEditButton}
             onClick={() => {
@@ -1969,7 +2128,7 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
     <div className={styles.section}>
       <div className={styles.sectionHeader}>
         <h3 className={styles.sectionTitle}>Batch Classification API</h3>
-        {routerConfig.api?.batch_classification && (
+        {routerConfig.api?.batch_classification && !isReadonly && (
           <button
             className={styles.sectionEditButton}
             onClick={() => {
@@ -2177,6 +2336,45 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
       })
     })
 
+    // Latency
+    signals?.latency?.forEach(lat => {
+      const parts: string[] = []
+      if (lat.tpot_percentile) {
+        parts.push(`TPOT: ${lat.tpot_percentile}th percentile`)
+      }
+      if (lat.ttft_percentile) {
+        parts.push(`TTFT: ${lat.ttft_percentile}th percentile`)
+      }
+      allSignals.push({
+        name: lat.name,
+        type: 'Latency',
+        summary: parts.length > 0 ? parts.join(', ') : 'Latency signal',
+        rawData: lat
+      })
+    })
+
+    // Context
+    signals?.context?.forEach(ctx => {
+      allSignals.push({
+        name: ctx.name,
+        type: 'Context',
+        summary: `${ctx.min_tokens} to ${ctx.max_tokens} tokens`,
+        rawData: ctx
+      })
+    })
+
+    // Complexity
+    signals?.complexity?.forEach(comp => {
+      const hardCount = comp.hard?.candidates?.length || 0
+      const easyCount = comp.easy?.candidates?.length || 0
+      allSignals.push({
+        name: comp.name,
+        type: 'Complexity',
+        summary: `Threshold: ${comp.threshold}, ${hardCount} hard / ${easyCount} easy candidates`,
+        rawData: comp
+      })
+    })
+
     // Filter signals based on search
     const filteredSignals = allSignals.filter(signal =>
       signal.name.toLowerCase().includes(signalsSearch.toLowerCase()) ||
@@ -2205,7 +2403,10 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
             'Preference': 'rgba(234, 179, 8, 0.15)',
             'Fact Check': 'rgba(34, 197, 94, 0.15)',
             'User Feedback': 'rgba(236, 72, 153, 0.15)',
-            'Language': 'rgba(59, 130, 246, 0.15)'
+            'Language': 'rgba(59, 130, 246, 0.15)',
+            'Latency': 'rgba(168, 85, 247, 0.15)',
+            'Context': 'rgba(251, 146, 60, 0.15)',
+            'Complexity': 'rgba(66, 153, 225, 0.15)'
           }
           return (
             <span className={styles.badge} style={{ background: typeColors[row.type] }}>
@@ -2325,6 +2526,94 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
             }
           ]
         })
+      } else if (signal.type === 'Language') {
+        sections.push({
+          title: 'Language Signal',
+          fields: [
+            { label: 'Language Code', value: signal.rawData.name || 'N/A', fullWidth: true },
+            { label: 'Description', value: signal.rawData.description || 'N/A', fullWidth: true }
+          ]
+        })
+      } else if (signal.type === 'Latency') {
+        sections.push({
+          title: 'Latency Signal',
+          fields: [
+            { label: 'TPOT Percentile', value: signal.rawData.tpot_percentile ? `${signal.rawData.tpot_percentile}th percentile` : 'N/A', fullWidth: true },
+            { label: 'TTFT Percentile', value: signal.rawData.ttft_percentile ? `${signal.rawData.ttft_percentile}th percentile` : 'N/A', fullWidth: true },
+            { label: 'Description', value: signal.rawData.description || 'N/A', fullWidth: true }
+          ]
+        })
+      } else if (signal.type === 'Context') {
+        sections.push({
+          title: 'Context Signal',
+          fields: [
+            { label: 'Min Tokens', value: signal.rawData.min_tokens || 'N/A', fullWidth: true },
+            { label: 'Max Tokens', value: signal.rawData.max_tokens || 'N/A', fullWidth: true },
+            { label: 'Description', value: signal.rawData.description || 'N/A', fullWidth: true }
+          ]
+        })
+      } else if (signal.type === 'Complexity') {
+        const fields: Array<{ label: string; value: React.ReactNode; fullWidth?: boolean }> = [
+          { label: 'Threshold', value: signal.rawData.threshold?.toString() || 'N/A', fullWidth: true }
+        ]
+
+        // Add composer if present
+        if (signal.rawData.composer) {
+          fields.push({
+            label: 'Composer',
+            value: (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                <div><strong>Operator:</strong> {signal.rawData.composer.operator}</div>
+                <div><strong>Conditions:</strong></div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem', marginLeft: '1rem' }}>
+                  {signal.rawData.composer.conditions.map((cond: { type: string; name: string }, i: number) => (
+                    <div key={i} style={{
+                      padding: '0.5rem',
+                      background: 'rgba(255, 165, 0, 0.1)',
+                      borderRadius: '4px',
+                      fontSize: '0.875rem',
+                      fontFamily: 'var(--font-mono)'
+                    }}>
+                      {cond.type}: {cond.name}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ),
+            fullWidth: true
+          })
+        }
+
+        fields.push(
+          {
+            label: 'Hard Candidates',
+            value: (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem', fontFamily: 'var(--font-mono)', fontSize: '0.875rem' }}>
+                {(signal.rawData.hard?.candidates || []).map((c: string, i: number) => (
+                  <div key={i}>• {c}</div>
+                ))}
+              </div>
+            ),
+            fullWidth: true
+          },
+          {
+            label: 'Easy Candidates',
+            value: (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem', fontFamily: 'var(--font-mono)', fontSize: '0.875rem' }}>
+                {(signal.rawData.easy?.candidates || []).map((c: string, i: number) => (
+                  <div key={i}>• {c}</div>
+                ))}
+              </div>
+            ),
+            fullWidth: true
+          },
+          { label: 'Description', value: signal.rawData.description || 'N/A', fullWidth: true }
+        )
+
+        sections.push({
+          title: 'Complexity Signal',
+          fields
+        })
       } else {
         // Preference, Fact Check, User Feedback
         sections.push({
@@ -2353,7 +2642,16 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
         threshold: 0.8,
         candidates: '',
         aggregation_method: 'mean',
-        mmlu_categories: ''
+        mmlu_categories: '',
+        tpot_percentile: undefined,
+        ttft_percentile: undefined,
+        min_tokens: '0',
+        max_tokens: '8K',
+        complexity_threshold: 0.1,
+        hard_candidates: '',
+        easy_candidates: '',
+        composer_operator: 'AND',
+        composer_conditions: ''
       }
 
       const initialData: AddSignalFormState = mode === 'edit' && signal ? {
@@ -2366,7 +2664,16 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
         threshold: signal.rawData.threshold ?? 0.8,
         candidates: (signal.rawData.candidates || []).join('\n'),
         aggregation_method: signal.rawData.aggregation_method || 'mean',
-        mmlu_categories: (signal.rawData.mmlu_categories || []).join('\n')
+        mmlu_categories: (signal.rawData.mmlu_categories || []).join('\n'),
+        tpot_percentile: signal.rawData.tpot_percentile,
+        ttft_percentile: signal.rawData.ttft_percentile,
+        min_tokens: signal.rawData.min_tokens || '0',
+        max_tokens: signal.rawData.max_tokens || '8K',
+        complexity_threshold: signal.rawData.threshold ?? 0.1,
+        hard_candidates: (signal.rawData.hard?.candidates || []).join('\n'),
+        easy_candidates: (signal.rawData.easy?.candidates || []).join('\n'),
+        composer_operator: signal.rawData.composer?.operator || 'AND',
+        composer_conditions: signal.rawData.composer?.conditions?.map((c: { type: string; name: string }) => `${c.type}:${c.name}`).join('\n') || ''
       } : defaultForm
 
 
@@ -2434,12 +2741,100 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
           shouldHide: conditionallyHideFieldExceptType('Domain')
         }
       ]
+
+      const latencyFields: FieldConfig[] = [
+        {
+          name: 'tpot_percentile',
+          label: 'TPOT Percentile (latency only)',
+          type: 'number',
+          min: 1,
+          max: 100,
+          step: 1,
+          placeholder: '10',
+          description: 'TPOT (Time Per Output Token) percentile bucket (1-100). Example: 10 = 10th percentile (top 10% fastest TPOT). Works with any number of observations, adapts to model performance. ⚠️ RECOMMENDED: Use both TPOT and TTFT for comprehensive latency evaluation.',
+          shouldHide: conditionallyHideFieldExceptType('Latency')
+        },
+        {
+          name: 'ttft_percentile',
+          label: 'TTFT Percentile (latency only)',
+          type: 'number',
+          min: 1,
+          max: 100,
+          step: 1,
+          placeholder: '10',
+          description: 'TTFT (Time To First Token) percentile bucket (1-100). Example: 10 = 10th percentile (top 10% fastest TTFT). Works with any number of observations, adapts to model performance. ⚠️ RECOMMENDED: Use both TPOT and TTFT for comprehensive latency evaluation. At least one of TPOT or TTFT percentile must be set.',
+          shouldHide: conditionallyHideFieldExceptType('Latency')
+        }
+      ]
+
+      const contextFields: FieldConfig[] = [
+        {
+          name: 'min_tokens',
+          label: 'Minimum Tokens (context only)',
+          type: 'text',
+          placeholder: 'e.g., 0, 8K, 1M',
+          description: 'Minimum token count (supports K/M suffixes)',
+          shouldHide: conditionallyHideFieldExceptType('Context')
+        },
+        {
+          name: 'max_tokens',
+          label: 'Maximum Tokens (context only)',
+          type: 'text',
+          placeholder: 'e.g., 8K, 1024K',
+          description: 'Maximum token count (supports K/M suffixes)',
+          shouldHide: conditionallyHideFieldExceptType('Context')
+        }
+      ]
+
+      const complexityFields: FieldConfig[] = [
+        {
+          name: 'complexity_threshold',
+          label: 'Threshold (complexity only)',
+          type: 'number',
+          placeholder: 'e.g., 0.1',
+          description: 'Similarity difference threshold for hard/easy classification',
+          shouldHide: conditionallyHideFieldExceptType('Complexity')
+        },
+        {
+          name: 'composer_operator',
+          label: 'Composer Operator (complexity only)',
+          type: 'select',
+          options: ['AND', 'OR'],
+          description: 'Logical operator for composer conditions (recommended to filter based on other signals)',
+          shouldHide: conditionallyHideFieldExceptType('Complexity')
+        },
+        {
+          name: 'composer_conditions',
+          label: 'Composer Conditions (complexity only)',
+          type: 'textarea',
+          placeholder: 'One condition per line in format type:name, e.g.:\ndomain:computer_science\nkeyword:coding',
+          description: 'Filter this complexity signal based on other signals (RECOMMENDED). Format: type:name per line',
+          shouldHide: conditionallyHideFieldExceptType('Complexity')
+        },
+        {
+          name: 'hard_candidates',
+          label: 'Hard Candidates (complexity only)',
+          type: 'textarea',
+          placeholder: 'One candidate per line, e.g.:\ndesign distributed system\nimplement consensus algorithm',
+          description: 'Phrases representing hard/complex queries',
+          shouldHide: conditionallyHideFieldExceptType('Complexity')
+        },
+        {
+          name: 'easy_candidates',
+          label: 'Easy Candidates (complexity only)',
+          type: 'textarea',
+          placeholder: 'One candidate per line, e.g.:\nprint hello world\nloop through array',
+          description: 'Phrases representing easy/simple queries',
+          shouldHide: conditionallyHideFieldExceptType('Complexity')
+        }
+      ]
+
       const fields: FieldConfig[] = [
         {
           name: 'type',
           label: 'Type',
           type: 'select',
-          options: ['Keywords', 'Embeddings', 'Domain', 'Preference', 'Fact Check', 'User Feedback'],
+          options: ['Keywords', 'Embeddings', 'Domain', 'Preference', 'Fact Check', 'User Feedback', 'Language', 'Latency', 'Context', 'Complexity'],
           required: true,
           description: 'Fields are validated based on the selected type.'
         },
@@ -2459,6 +2854,9 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
         ...keywordFields,
         ...embeddingFields,
         ...domainFields,
+        ...latencyFields,
+        ...contextFields,
+        ...complexityFields,
       ]
 
       const saveSignal = async (formData: AddSignalFormState) => {
@@ -2566,6 +2964,126 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
             ]
             break
           }
+          case 'Language': {
+            newConfig.signals.language = [
+              ...(newConfig.signals.language || []),
+              {
+                name
+              }
+            ]
+            break
+          }
+          case 'Latency': {
+            const tpot_percentile = formData.tpot_percentile
+            const ttft_percentile = formData.ttft_percentile
+
+            // Validate: at least one of tpot_percentile or ttft_percentile must be set
+            if ((tpot_percentile === undefined || tpot_percentile <= 0) && (ttft_percentile === undefined || ttft_percentile <= 0)) {
+              throw new Error('Either TPOT Percentile or TTFT Percentile must be set for latency signals (or both)')
+            }
+            if (tpot_percentile !== undefined && (tpot_percentile < 1 || tpot_percentile > 100)) {
+              throw new Error('TPOT Percentile must be between 1 and 100')
+            }
+            if (ttft_percentile !== undefined && (ttft_percentile < 1 || ttft_percentile > 100)) {
+              throw new Error('TTFT Percentile must be between 1 and 100')
+            }
+
+            const latencySignal: { name: string; description?: string; tpot_percentile?: number; ttft_percentile?: number } = {
+              name,
+            }
+            if (formData.description) {
+              latencySignal.description = formData.description
+            }
+            if (tpot_percentile !== undefined && tpot_percentile > 0) {
+              latencySignal.tpot_percentile = tpot_percentile
+            }
+            if (ttft_percentile !== undefined && ttft_percentile > 0) {
+              latencySignal.ttft_percentile = ttft_percentile
+            }
+
+            newConfig.signals.latency = [
+              ...(newConfig.signals.latency || []),
+              latencySignal
+            ]
+            break
+          }
+          case 'Context': {
+            const min_tokens = (formData.min_tokens || '0').trim()
+            const max_tokens = (formData.max_tokens || '8K').trim()
+            if (!min_tokens || !max_tokens) {
+              throw new Error('Both min_tokens and max_tokens are required.')
+            }
+            newConfig.signals.context = [
+              ...(newConfig.signals.context || []),
+              {
+                name,
+                min_tokens,
+                max_tokens,
+                description: formData.description || undefined
+              }
+            ]
+            break
+          }
+          case 'Complexity': {
+            const complexity_threshold = formData.complexity_threshold ?? 0.1
+            const hard_candidates = (formData.hard_candidates || '').trim()
+            const easy_candidates = (formData.easy_candidates || '').trim()
+
+            if (!hard_candidates || !easy_candidates) {
+              throw new Error('Both hard and easy candidates are required.')
+            }
+
+            const hardList = hard_candidates.split('\n').map(c => c.trim()).filter(c => c.length > 0)
+            const easyList = easy_candidates.split('\n').map(c => c.trim()).filter(c => c.length > 0)
+
+            if (hardList.length === 0 || easyList.length === 0) {
+              throw new Error('Both hard and easy candidates must have at least one entry.')
+            }
+
+            // Parse composer conditions if provided
+            const composer_conditions_str = (formData.composer_conditions || '').trim()
+            let composer = undefined
+            if (composer_conditions_str) {
+              const conditions = composer_conditions_str
+                .split('\n')
+                .map(line => line.trim())
+                .filter(line => line.length > 0)
+                .map(line => {
+                  const parts = line.split(':')
+                  if (parts.length !== 2) {
+                    throw new Error(`Invalid composer condition format: "${line}". Expected format: type:name`)
+                  }
+                  return {
+                    type: parts[0].trim(),
+                    name: parts[1].trim()
+                  }
+                })
+
+              if (conditions.length > 0) {
+                composer = {
+                  operator: formData.composer_operator || 'AND',
+                  conditions
+                }
+              }
+            }
+
+            newConfig.signals.complexity = [
+              ...(newConfig.signals.complexity || []),
+              {
+                name,
+                threshold: complexity_threshold,
+                hard: {
+                  candidates: hardList
+                },
+                easy: {
+                  candidates: easyList
+                },
+                description: formData.description || undefined,
+                ...(composer && { composer })
+              }
+            ]
+            break
+          }
           default:
             throw new Error('Unsupported signal type.')
         }
@@ -2611,6 +3129,7 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
           onSearchChange={setSignalsSearch}
           onAdd={() => openSignalEditor('add')}
           addButtonText="Add Signal"
+          disabled={isReadonly}
         />
 
         {isPythonCLI ? (
@@ -2622,6 +3141,7 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
             onEdit={handleEditSignal}
             onDelete={handleDeleteSignal}
             emptyMessage={signalsSearch ? 'No signals match your search' : 'No signals configured'}
+            readonly={isReadonly}
           />
         ) : (
           <div className={styles.emptyState}>
@@ -2782,7 +3302,7 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
 
     const openDecisionEditor = (mode: 'add' | 'edit', decision?: DecisionRow) => {
       setViewModalOpen(false)
-      const conditionTypeOptions = ['keyword', 'domain', 'preference', 'user_feedback', 'embedding'] as const
+      const conditionTypeOptions = ['keyword', 'domain', 'preference', 'user_feedback', 'embedding', 'language', 'latency'] as const
 
       const getConditionNameOptions = (type?: DecisionConditionType) => {
         // derive condition name options based on signals configured
@@ -2797,8 +3317,10 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
             return config?.signals?.user_feedbacks?.map((u) => u.name) || []
           case 'embedding':
             return config?.signals?.embeddings?.map((e) => e.name) || []
+          case 'latency':
+            return config?.signals?.latency?.map((l) => l.name) || []
           default:
-            return ["ABC"]
+            return []
         }
       }
 
@@ -3264,6 +3786,7 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
           onSearchChange={setDecisionsSearch}
           onAdd={() => openDecisionEditor('add')}
           addButtonText="Add Decision"
+          disabled={isReadonly}
         />
 
         {isPythonCLI ? (
@@ -3275,6 +3798,7 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
             onEdit={handleEditDecision}
             onDelete={handleDeleteDecision}
             emptyMessage={decisionsSearch ? 'No decisions match your search' : 'No routing decisions configured'}
+            readonly={isReadonly}
           />
         ) : (
           <div className={styles.emptyState}>
@@ -3393,7 +3917,7 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
                 <tr key={idx} style={{ borderBottom: '1px solid rgba(255, 255, 255, 0.05)' }}>
                   <td style={{ padding: '0.75rem 0.5rem', fontSize: '0.875rem', fontWeight: 500 }}>{ep.name}</td>
                   <td style={{ padding: '0.75rem 0.5rem', fontSize: '0.875rem', fontFamily: 'var(--font-mono)', color: 'var(--color-text-secondary)' }}>
-                    {ep.endpoint || 'N/A'}
+                    {isReadonly ? '************' : (ep.endpoint || 'N/A')}
                   </td>
                   <td style={{ padding: '0.75rem 0.5rem', textAlign: 'center' }}>
                     <span style={{
@@ -3468,7 +3992,7 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
                           color: 'var(--color-text-secondary)'
                         }}>
                           <span style={{ fontFamily: 'var(--font-mono)' }}>
-                            {ep.endpoint}
+                            {isReadonly ? '************' : ep.endpoint}
                           </span>
                           <span>
                             <span style={{
@@ -3964,6 +4488,7 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
           onSearchChange={() => { }}
           onAdd={handleAddReasoningFamily}
           addButtonText="Add Family"
+          disabled={isReadonly}
         />
 
         <DataTable
@@ -3974,6 +4499,7 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
           onEdit={(row) => handleEditReasoningFamily(row.name)}
           onDelete={(row) => handleDeleteReasoningFamily(row.name)}
           emptyMessage="No reasoning families configured"
+          readonly={isReadonly}
         />
 
         {/* Models Table */}
@@ -3986,6 +4512,7 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
             onSearchChange={setModelsSearch}
             onAdd={handleAddModel}
             addButtonText="Add Model"
+            disabled={isReadonly}
           />
 
           <DataTable
@@ -4000,6 +4527,7 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
             isRowExpanded={(row) => expandedModels.has(row.name)}
             onToggleExpand={handleToggleExpand}
             emptyMessage={modelsSearch ? 'No models match your search' : 'No models configured'}
+            readonly={isReadonly}
           />
         </div>
       </div>
@@ -4018,6 +4546,9 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
 
       {/* Classifier */}
       {renderClassifyBERT()}
+
+      {/* Preference Model */}
+      {renderPreferenceModel()}
 
       {/* Tools */}
       {renderToolsConfiguration()}
@@ -4044,6 +4575,8 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
         return renderModelsSection()
       case 'router-config':
         return renderRouterConfigSection()
+      case 'mcp':
+        return <MCPConfigPanel />
       default:
         return renderSignalsSection()
     }
@@ -4051,7 +4584,6 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
 
   return (
     <div className={styles.container}>
-
       <div className={styles.content}>
         {loading && (
           <div className={styles.loading}>
@@ -4092,7 +4624,7 @@ const ConfigPage: React.FC<ConfigPageProps> = ({ activeSection = 'signals' }) =>
       <ViewModal
         isOpen={viewModalOpen}
         onClose={handleCloseViewModal}
-        onEdit={viewModalEditCallback || undefined}
+        onEdit={isReadonly ? undefined : (viewModalEditCallback || undefined)}
         title={viewModalTitle}
         sections={viewModalSections}
       />

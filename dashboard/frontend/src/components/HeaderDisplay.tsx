@@ -62,6 +62,26 @@ const HEADER_INFO: Record<string, { label: string; type: 'info' | 'success' | 'w
     label: 'Preference',
     type: 'info',
   },
+  'x-vsr-matched-language': {
+    label: 'Language',
+    type: 'info',
+  },
+  'x-vsr-matched-latency': {
+    label: 'Latency',
+    type: 'info',
+  },
+  'x-vsr-matched-context': {
+    label: 'Context',
+    type: 'info',
+  },
+  'x-vsr-context-token-count': {
+    label: 'Context Count',
+    type: 'info',
+  },
+  'x-vsr-matched-complexity': {
+    label: 'Complexity',
+    type: 'info',
+  },
   // Looper headers
   'x-vsr-looper-models-used': {
     label: 'Collaborative Models',

@@ -10,14 +10,11 @@ import (
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/metrics"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/observability/tracing"
 	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/utils/http"
-	"github.com/vllm-project/semantic-router/src/semantic-router/pkg/utils/pii"
 )
 
-// performJailbreaks performs PII and jailbreak detection with category-specific settings
+// performJailbreaks performs jailbreak detection with category-specific settings
+// By default, only checks the current user message. Set include_history: true in plugin config to include conversation history.
 func (r *OpenAIRouter) performJailbreaks(ctx *RequestContext, userContent string, nonUserMessages []string, categoryName string) (*ext_proc.ProcessingResponse, bool) {
-	// Perform PII classification on all message content
-	allContent := pii.ExtractAllContent(userContent, nonUserMessages)
-
 	// Check if jailbreak detection is enabled for this decision
 	jailbreakEnabled := r.Classifier.IsJailbreakEnabled()
 	if categoryName != "" && r.Config != nil {
@@ -31,22 +28,34 @@ func (r *OpenAIRouter) performJailbreaks(ctx *RequestContext, userContent string
 		jailbreakThreshold = r.Config.GetJailbreakThresholdForDecision(categoryName)
 	}
 
-	// Perform jailbreak detection on all message content
+	// Get decision-specific include_history setting
+	includeHistory := false
+	if categoryName != "" && r.Config != nil {
+		includeHistory = r.Config.GetJailbreakIncludeHistoryForDecision(categoryName)
+	}
+
+	// Perform jailbreak detection
 	if jailbreakEnabled {
-		// Start jailbreak detection span
-		spanCtx, span := tracing.StartSpan(ctx.TraceContext, tracing.SpanJailbreakDetection)
-		defer span.End()
+		// Start jailbreak plugin span
+		spanCtx, span := tracing.StartPluginSpan(ctx.TraceContext, "jailbreak", categoryName)
+
+		// Build content to analyze based on include_history setting
+		contentToAnalyze := []string{}
+		if userContent != "" {
+			contentToAnalyze = append(contentToAnalyze, userContent)
+		}
+		if includeHistory {
+			contentToAnalyze = append(contentToAnalyze, nonUserMessages...)
+		}
 
 		startTime := time.Now()
-		hasJailbreak, jailbreakDetections, err := r.Classifier.AnalyzeContentForJailbreakWithThreshold(allContent, jailbreakThreshold)
+		hasJailbreak, jailbreakDetections, err := r.Classifier.AnalyzeContentForJailbreakWithThreshold(contentToAnalyze, jailbreakThreshold)
 		detectionTime := time.Since(startTime).Milliseconds()
-
-		tracing.SetSpanAttributes(span,
-			attribute.Int64(tracing.AttrJailbreakDetectionTimeMs, detectionTime))
 
 		if err != nil {
 			logging.Errorf("Error performing jailbreak analysis: %v", err)
 			tracing.RecordError(span, err)
+			tracing.EndPluginSpan(span, "error", detectionTime, "analysis_failed")
 			// Continue processing despite jailbreak analysis error
 			metrics.RecordRequestError(ctx.RequestModel, "classification_failed")
 		} else if hasJailbreak {
@@ -61,10 +70,19 @@ func (r *OpenAIRouter) performJailbreaks(ctx *RequestContext, userContent string
 				}
 			}
 
+			// Track jailbreak detection in context for replay recording
+			ctx.JailbreakDetected = true
+			ctx.JailbreakType = jailbreakType
+			ctx.JailbreakConfidence = confidence
+
+			// Keep legacy attributes for backward compatibility
 			tracing.SetSpanAttributes(span,
 				attribute.Bool(tracing.AttrJailbreakDetected, true),
 				attribute.String(tracing.AttrJailbreakType, jailbreakType),
 				attribute.String(tracing.AttrSecurityAction, "blocked"))
+
+			// End plugin span with blocked status
+			tracing.EndPluginSpan(span, "blocked", detectionTime, "jailbreak_detected:"+jailbreakType)
 
 			logging.Warnf("JAILBREAK ATTEMPT BLOCKED: %s (confidence: %.3f)", jailbreakType, confidence)
 
@@ -82,8 +100,13 @@ func (r *OpenAIRouter) performJailbreaks(ctx *RequestContext, userContent string
 			ctx.TraceContext = spanCtx
 			return jailbreakResponse, true
 		} else {
+			// Keep legacy attributes for backward compatibility
 			tracing.SetSpanAttributes(span,
 				attribute.Bool(tracing.AttrJailbreakDetected, false))
+
+			// End plugin span with success status
+			tracing.EndPluginSpan(span, "success", detectionTime, "no_jailbreak_detected")
+
 			logging.Infof("No jailbreak detected in request content")
 			ctx.TraceContext = spanCtx
 		}

@@ -109,6 +109,8 @@ func (s *ClassificationAPIServer) setupRoutes() *http.ServeMux {
 	mux.HandleFunc("POST /api/v1/classify/intent", s.handleIntentClassification)
 	mux.HandleFunc("POST /api/v1/classify/pii", s.handlePIIDetection)
 	mux.HandleFunc("POST /api/v1/classify/security", s.handleSecurityDetection)
+	mux.HandleFunc("POST /api/v1/classify/fact-check", s.handleFactCheckClassification)
+	mux.HandleFunc("POST /api/v1/classify/user-feedback", s.handleUserFeedbackClassification)
 	mux.HandleFunc("POST /api/v1/classify/combined", s.handleCombinedClassification)
 	mux.HandleFunc("POST /api/v1/classify/batch", s.handleBatchClassification)
 
@@ -127,6 +129,10 @@ func (s *ClassificationAPIServer) setupRoutes() *http.ServeMux {
 
 	// Metrics endpoints
 	mux.HandleFunc("GET /metrics/classification", s.handleClassificationMetrics)
+
+	// Model selection feedback endpoints
+	mux.HandleFunc("POST /api/v1/feedback", s.handleFeedback)
+	mux.HandleFunc("GET /api/v1/ratings", s.handleGetRatings)
 
 	// Configuration endpoints
 	mux.HandleFunc("GET /config/classification", s.handleGetConfig)

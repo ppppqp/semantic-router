@@ -3,7 +3,7 @@
 import copy
 from typing import Dict, Any, List
 
-from cli.models import UserConfig, Domain
+from cli.models import UserConfig, PluginType
 from cli.defaults import load_embedded_defaults
 from cli.utils import getLogger
 
@@ -119,6 +119,115 @@ def translate_preference_signals(preferences: list) -> list:
     return rules
 
 
+def translate_language_signals(languages: list) -> list:
+    """
+    Translate language signals to router format.
+
+    Args:
+        languages: List of Language objects
+
+    Returns:
+        list: Router language rules
+    """
+    rules = []
+    for signal in languages:
+        rule = {
+            "name": signal.name,
+        }
+        if signal.description:
+            rule["description"] = signal.description
+        rules.append(rule)
+    return rules
+
+
+def translate_latency_signals(latencies: list) -> list:
+    """
+    Translate latency signals to router format.
+
+    Args:
+        latencies: List of Latency objects
+
+    Returns:
+        list: Router latency rules
+    """
+    rules = []
+    for signal in latencies:
+        rule = {
+            "name": signal.name,
+        }
+        # At least one of tpot_percentile or ttft_percentile should be set
+        if signal.tpot_percentile is not None and signal.tpot_percentile > 0:
+            rule["tpot_percentile"] = signal.tpot_percentile
+        if signal.ttft_percentile is not None and signal.ttft_percentile > 0:
+            rule["ttft_percentile"] = signal.ttft_percentile
+
+        # Validate that at least one is set
+        if "tpot_percentile" not in rule and "ttft_percentile" not in rule:
+            log.warn(
+                f"Latency signal '{signal.name}' has neither tpot_percentile nor ttft_percentile set, skipping"
+            )
+            continue
+
+        if signal.description:
+            rule["description"] = signal.description
+        rules.append(rule)
+    return rules
+
+
+def translate_context_signals(context_rules: list) -> list:
+    """
+    Translate context signals to router format.
+
+    Args:
+        context_rules: List of ContextRule objects
+
+    Returns:
+        list: Router context rules
+    """
+    rules = []
+    for signal in context_rules:
+        rule = {
+            "name": signal.name,
+            "min_tokens": signal.min_tokens,
+            "max_tokens": signal.max_tokens,
+        }
+        if signal.description:
+            rule["description"] = signal.description
+        rules.append(rule)
+    return rules
+
+
+def translate_complexity_signals(complexity_rules: list) -> list:
+    """
+    Translate complexity signals to router format.
+
+    Args:
+        complexity_rules: List of ComplexityRule objects
+
+    Returns:
+        list: Router complexity rules
+    """
+    rules = []
+    for signal in complexity_rules:
+        rule = {
+            "name": signal.name,
+            "threshold": signal.threshold,
+            "hard": {"candidates": signal.hard.candidates},
+            "easy": {"candidates": signal.easy.candidates},
+        }
+        if signal.description:
+            rule["description"] = signal.description
+        if signal.composer:
+            rule["composer"] = {
+                "operator": signal.composer.operator,
+                "conditions": [
+                    {"type": c.type, "name": c.name} for c in signal.composer.conditions
+                ],
+            }
+        rules.append(rule)
+    return rules
+
+
 def translate_external_models(external_models: list) -> list:
     """
     Translate external models to router format.
@@ -223,6 +332,10 @@ def translate_providers_to_router_format(providers) -> Dict[str, Any]:
             "reasoning_family": model.reasoning_family,
             "access_key": model.access_key,
         }
+
+        # Add api_format if provided
+        if model.api_format:
+            model_config[model.name]["api_format"] = model.api_format
 
         # Add pricing if provided
         if model.pricing:
@@ -353,6 +466,32 @@ def merge_configs(user_config: UserConfig, defaults: Dict[str, Any]) -> Dict[str
                 f"  Added {len(user_config.signals.preferences)} preference signals"
             )
 
+        if user_config.signals.language and len(user_config.signals.language) > 0:
+            merged["language_rules"] = translate_language_signals(
+                user_config.signals.language
+            )
+            log.info(f"  Added {len(user_config.signals.language)} language signals")
+
+        if user_config.signals.latency and len(user_config.signals.latency) > 0:
+            merged["latency_rules"] = translate_latency_signals(
+                user_config.signals.latency
+            )
+            log.info(f"  Added {len(user_config.signals.latency)} latency signals")
+
+        if user_config.signals.context and len(user_config.signals.context) > 0:
+            merged["context_rules"] = translate_context_signals(
+                user_config.signals.context
+            )
+            log.info(f"  Added {len(user_config.signals.context)} context signals")
+
+        if user_config.signals.complexity and len(user_config.signals.complexity) > 0:
+            merged["complexity_rules"] = translate_complexity_signals(
+                user_config.signals.complexity
+            )
+            log.info(
+                f"  Added {len(user_config.signals.complexity)} complexity signals"
+            )
+
         # Translate domains to categories
         if user_config.signals.domains:
             merged["categories"] = translate_domains_to_categories(
@@ -375,7 +514,21 @@ def merge_configs(user_config: UserConfig, defaults: Dict[str, Any]) -> Dict[str
         )
 
     # Add decisions (convert to dict)
-    merged["decisions"] = [decision.model_dump() for decision in user_config.decisions]
+    # Use mode='python' to ensure proper enum handling
+    decisions_list = []
+    for decision in user_config.decisions:
+        decision_dict = decision.model_dump(mode="python")
+        # Post-process plugins to ensure PluginType enums are converted to strings
+        if "plugins" in decision_dict and decision_dict["plugins"]:
+            for plugin in decision_dict["plugins"]:
+                if "type" in plugin:
+                    # Convert PluginType enum to string value
+                    if isinstance(plugin["type"], PluginType):
+                        plugin["type"] = plugin["type"].value
+                    elif hasattr(plugin["type"], "value"):
+                        plugin["type"] = plugin["type"].value
+        decisions_list.append(decision_dict)
+    merged["decisions"] = decisions_list
     log.info(f"  Added {len(user_config.decisions)} decisions")
 
     # Translate providers

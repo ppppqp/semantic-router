@@ -206,6 +206,46 @@ docker-compose-ps-ci:
 	@$(LOG_TARGET)
 	@$(COMPOSE_CMD) -f $(CI_COMPOSE_FILE) ps
 
+##@ Response API Docker Compose (for Response API testing)
+
+# Response API compose file path
+RESPONSE_API_COMPOSE_FILE ?= deploy/docker-compose/docker-compose.response-api.yml
+
+response-api-test-up: ## Start Response API test services (semantic-router, envoy, mock-vllm)
+response-api-test-up:
+	@$(LOG_TARGET)
+	@echo "Building and starting Response API test services..."
+	@$(COMPOSE_CMD) -f $(RESPONSE_API_COMPOSE_FILE) up -d --build
+
+response-api-test-down: ## Stop Response API test services
+response-api-test-down:
+	@$(LOG_TARGET)
+	@echo "Stopping Response API test services..."
+	@$(COMPOSE_CMD) -f $(RESPONSE_API_COMPOSE_FILE) down
+
+response-api-test-logs: ## Show logs for Response API test services
+response-api-test-logs:
+	@$(LOG_TARGET)
+	@$(COMPOSE_CMD) -f $(RESPONSE_API_COMPOSE_FILE) logs -f
+
+response-api-test-ps: ## Show status of Response API test services
+response-api-test-ps:
+	@$(LOG_TARGET)
+	@$(COMPOSE_CMD) -f $(RESPONSE_API_COMPOSE_FILE) ps
+
+response-api-test-run: ## Run Response API error handling tests
+response-api-test-run:
+	@$(LOG_TARGET)
+	@echo "Running Response API error handling tests..."
+	@./scripts/test-response-api-errors.sh
+
+response-api-test: ## Start services and run Response API error handling tests
+response-api-test: response-api-test-up
+	@$(LOG_TARGET)
+	@echo "Waiting for services to be healthy..."
+	@sleep 10
+	@$(MAKE) response-api-test-run
+	@$(MAKE) response-api-test-down
 # Help target for Docker commands
 docker-help:
 docker-help: ## Show help for Docker-related make targets and environment variables
@@ -270,3 +310,16 @@ vllm-sr-start: vllm-sr-dev
 	@echo "Starting vLLM Semantic Router service..."
 	@vllm-sr serve --image-pull-policy=ifnotpresent --image $(VLLM_SR_IMAGE)
 	@vllm-sr dashboard
+
+##@ vLLM-SR Tests (e2e tests for vllm-sr CLI)
+# Tests are located in e2e/testing/vllm-sr-cli/
+
+vllm-sr-test: ## Run CLI unit tests (fast, no Docker image required)
+vllm-sr-test:
+	@$(LOG_TARGET)
+	@cd e2e/testing/vllm-sr-cli && python run_cli_tests.py --verbose
+
+vllm-sr-test-integration: ## Run CLI unit + integration tests (requires Docker image)
+vllm-sr-test-integration: vllm-sr-build
+	@$(LOG_TARGET)
+	@cd e2e/testing/vllm-sr-cli && RUN_INTEGRATION_TESTS=true python run_cli_tests.py --verbose --integration
